@@ -42,7 +42,7 @@ jobs:
             "steamclient_experimental",
           ]
         arch: ["x64"]
-        cfg: ["release"]
+        cfg: ["debug"]
 
     steps:
       # clone branch
