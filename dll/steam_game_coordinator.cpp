@@ -16,6 +16,7 @@
    <http://www.gnu.org/licenses/>.  */
 
 #include "dll/steam_game_coordinator.h"
+#include "dll/gbe_cs2_hello_template.h"
 #include "dll/dll.h"
 #include <steammessages.pb.h>
 #include <tf2/base_gcmessages.pb.h>
@@ -577,6 +578,10 @@ void Steam_Game_Coordinator::send_cs2_matchmaking_hello()
     // CMsgGCCStrike15_v2_MatchmakingGC2ClientHello, field 1 = account_id (varint).
     put_varint(message, (1u << 3) | 0u);
     put_varint(message, account_id);
+    // Append the rest of a real hello (field 3 global_stats + field 6 vac_banned=0)
+    // captured from RevEmu, so the client sees a complete hello and treats the GC as
+    // connected instead of showing "Ошибка подключения Steam" on the inventory/store.
+    message.append(reinterpret_cast<const char *>(REVEMU_9110_TEMPLATE), REVEMU_9110_TEMPLATE_LEN);
 
     push_incoming(msg_type, message);
 }
