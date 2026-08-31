@@ -16,6 +16,7 @@
    <http://www.gnu.org/licenses/>.  */
 
 #include "dll/steam_networking_socketsserialized.h"
+#include "dll/gbe_sdr_cert_data.h"
 
 
 void Steam_Networking_Sockets_Serialized::steam_callback(void *object, Common_Message *msg)
@@ -67,10 +68,26 @@ void Steam_Networking_Sockets_Serialized::SendP2PConnectionFailure( CSteamID ste
 
 SteamAPICall_t Steam_Networking_Sockets_Serialized::GetCertAsync()
 {
-    PRINT_DEBUG_TODO();
+    PRINT_DEBUG_ENTRY();
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
+    // Precomputed self-issued SDR certificate. The leaf cert is signed by our own
+    // fixed Ed25519 CA; the CA public key is patched into steamnetworkingsockets.dll
+    // (replacing Valve's hardcoded root) so the client's CertStore accepts it and
+    // AuthStatus becomes OK. Without this the client reports "Cert request returned
+    // invalid cert" and gates the inventory/econ UI behind "Steam connection error".
     struct SteamNetworkingSocketsCert_t data = {};
     data.m_eResult = k_EResultOK;
+
+    data.m_cbCert = GBE_SDR_CERT_LEN;
+    memcpy(data.m_certOrMsg, GBE_SDR_CERT, GBE_SDR_CERT_LEN);
+
+    data.m_caKeyID = GBE_SDR_CA_KEY_ID;
+
+    data.m_cbSignature = GBE_SDR_SIG_LEN;
+    memcpy(data.m_signature, GBE_SDR_SIG, GBE_SDR_SIG_LEN);
+
+    data.m_cbPrivKey = sizeof(GBE_SDR_ID_PRIV);
+    memcpy(data.m_privKey, GBE_SDR_ID_PRIV, sizeof(GBE_SDR_ID_PRIV));
 
     auto ret = callback_results->addCallResult(data.k_iCallback, &data, sizeof(data));
     callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
