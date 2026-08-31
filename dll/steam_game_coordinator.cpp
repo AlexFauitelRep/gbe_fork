@@ -546,6 +546,39 @@ void Steam_Game_Coordinator::callback_client_welcome()
 
     protomsg.AppendToString(&message);
     push_incoming(msg_type, message);
+
+    // CS2/CS:GO only: also announce the GC as connected (see send_cs2_matchmaking_hello).
+    if (gc_profile == GC_PROFILE_CSGO)
+        send_cs2_matchmaking_hello();
+}
+
+// CS2/CS:GO: the client repeatedly sends MatchmakingClient2GCHello (9194) and, until it
+// receives a MatchmakingGC2ClientHello (9110), treats the CS2 Game Coordinator as
+// disconnected -> opening the inventory/store shows "Ошибка подключения Steam" ("failed
+// to connect to Steam network"), even though the econ SO cache is already delivered.
+// RevEmu ships this hello (platform\9110.bin). We synthesize a minimal one carrying the
+// local account_id, which is enough for the client to consider the GC connected and let
+// the loadout/inventory render the SO-cache items. Rankings/medals are omitted (the card
+// just shows a default rating); the inventory itself comes from the SO cache, not here.
+void Steam_Game_Coordinator::send_cs2_matchmaking_hello()
+{
+    if (!gc_initialized || gc_profile != GC_PROFILE_CSGO)
+        return;
+
+    constexpr uint32 k_EMsgGCCStrike15_v2_MatchmakingGC2ClientHello = 9110;
+    uint32 msg_type = k_EMsgGCCStrike15_v2_MatchmakingGC2ClientHello | protobuf_mask;
+    std::string message = build_protomsg_header(msg_type);
+
+    uint32 account_id = settings->get_local_steam_id().GetAccountID();
+    auto put_varint = [](std::string &s, uint64 v) {
+        while (v >= 0x80) { s.push_back(static_cast<char>((v & 0x7f) | 0x80)); v >>= 7; }
+        s.push_back(static_cast<char>(v));
+    };
+    // CMsgGCCStrike15_v2_MatchmakingGC2ClientHello, field 1 = account_id (varint).
+    put_varint(message, (1u << 3) | 0u);
+    put_varint(message, account_id);
+
+    push_incoming(msg_type, message);
 }
 
 void Steam_Game_Coordinator::callback_server_welcome()
@@ -1145,6 +1178,10 @@ EGCResults Steam_Game_Coordinator::SendMessage_( uint32 unMsgType, const void *p
         case EGCItemMsg::k_EMsgGCSetItemPositions | protobuf_mask:
             PRINT_DEBUG("k_EMsgGCSetItemPositions");
             handle_set_multiple_item_pos(pubData, cubData);
+            break;
+        case 9194u | protobuf_mask:  // k_EMsgGCCStrike15_v2_MatchmakingClient2GCHello
+            PRINT_DEBUG("CS2 MatchmakingClient2GCHello -> reply MatchmakingGC2ClientHello");
+            send_cs2_matchmaking_hello();
             break;
         default:
             break;

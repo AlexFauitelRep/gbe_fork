@@ -110,6 +110,7 @@ public ISteamGameCoordinator
 
     void callback_client_welcome();
     void callback_server_welcome();
+    void send_cs2_matchmaking_hello();
     void callback_items_received(CSteamID steam_id, const std::vector<Econ_Item> &items);
     void callback_items_removed(CSteamID steam_id);
     void callback_item_updated(CSteamID steam_id, const Econ_Item &item);
