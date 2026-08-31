@@ -57,6 +57,7 @@ public ISteamGameCoordinator
     {
         GC_PROFILE_INVALID = 0,
         GC_PROFILE_TF2,
+        GC_PROFILE_CSGO,
         //GC_PROFILE_PORTAL2,
     };
 

@@ -28,6 +28,12 @@ using namespace gamecoordinator::tf2;
 
 constexpr int GC_MIN_VERSION = 20091217;
 
+// CS2/CS:GO (appid 730): the client treats a SharedObject cache whose version is 0
+// as "unsubscribed" and falls back to default (unpainted) item icons. RevEmu's proxy
+// works around this by forcing a non-zero cache/welcome version; we reproduce that here
+// for the CSGO profile so equipped skins render offline without any Game Coordinator.
+constexpr unsigned long long CSGO_SO_CACHE_VERSION = 7ull;
+
 #pragma pack( push, 1 )
 //-----------------------------------------------------------------------------
 // Purpose: Header for messages from a client or gameserver to or from the GC
@@ -119,6 +125,12 @@ void Steam_Game_Coordinator::parse_gc_config()
             //gc_profile = GC_PROFILE_PORTAL2;
             gc_profile = GC_PROFILE_TF2;
             is_portal2 = true;
+        } else if (gc_profile_name == "csgo" || gc_profile_name == "cs2" || gc_profile_name == "cs") {
+            // CS:GO / CS2 (appid 730). The econ SharedObject cache (CSOEconItem) is binary
+            // compatible with the TF2 protobuf structs (same field tags), so we reuse the same
+            // CMsgClientWelcome / CMsgSOCacheSubscribed path and only diverge where CS2 requires
+            // a non-zero cache version to consider the cache subscribed (see CSGO_SO_CACHE_VERSION).
+            gc_profile = GC_PROFILE_CSGO;
         } else {
             gc_profile = GC_PROFILE_INVALID;
         }
@@ -528,7 +540,9 @@ void Steam_Game_Coordinator::callback_client_welcome()
     std::string message = build_protomsg_header(msg_type);
 
     CMsgClientWelcome protomsg;
-    protomsg.set_version(0);
+    // CS2/CS:GO treats a welcome/cache with version 0 as unsubscribed (default icons),
+    // so advertise a non-zero version for that profile only. TF2 keeps its original 0.
+    protomsg.set_version(gc_profile == GC_PROFILE_CSGO ? static_cast<uint32>(CSGO_SO_CACHE_VERSION) : 0);
 
     protomsg.AppendToString(&message);
     push_incoming(msg_type, message);
@@ -583,6 +597,10 @@ void Steam_Game_Coordinator::callback_items_received(CSteamID steam_id, const st
 
         CMsgSOCacheSubscribed protomsg;
         protomsg.set_owner(steam_id.ConvertToUint64());
+        // CS2/CS:GO requires a non-zero cache version or the client renders default icons
+        // and never fires SOCreated for the equipped skins. TF2 is unaffected (left absent).
+        if (gc_profile == GC_PROFILE_CSGO)
+            protomsg.set_version(CSGO_SO_CACHE_VERSION);
         auto objects = protomsg.add_objects();
         objects->set_type_id(1);
 
