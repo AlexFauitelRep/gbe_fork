@@ -586,9 +586,18 @@ void Steam_Game_Coordinator::callback_client_welcome()
         cache.set_owner(steam_id.ConvertToUint64());
         cache.set_version(CSGO_SO_CACHE_VERSION);
         auto objects = cache.add_objects();
-        objects->set_type_id(1);
+        objects->set_type_id(1);   // CSOEconItem (the skins)
         for (const Econ_Item &item : items)
             objects->add_object_data(item_to_gcprotobuf(item, steam_id));
+        // CS2 requires the CSOEconGameAccountClient (SO type 7) in the cache, otherwise the
+        // econ subsystem never initializes and the Inventory/Loadout tabs stay locked. RevEmu
+        // always ships it; replay the minimal default object it sends.
+        auto acct = cache.add_objects();
+        acct->set_type_id(7);      // CSOEconGameAccountClient
+        static const unsigned char account_client[] =
+            { 0x08, 0x00, 0x65, 0x00, 0x00, 0x00, 0x00, 0x68, 0x00 };
+        acct->add_object_data(std::string(
+            reinterpret_cast<const char *>(account_client), sizeof(account_client)));
         std::string cache_bytes;
         cache.SerializeToString(&cache_bytes);
 
