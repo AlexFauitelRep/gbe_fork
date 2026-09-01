@@ -53,6 +53,12 @@ struct Steam_Http_Request {
 	// target local filepath to save
 	std::string target_filepath{};
 
+	// Set when the caller adds "Cache-Control: only-if-cached". Per HTTP semantics the server must
+	// answer 504 (Gateway Timeout) when the resource is not in cache. CS2's SteamNetworkingSockets
+	// SDR-config fetch relies on this: a bogus 200 makes it ignore the body and wait ~60s before the
+	// real (non-cached) retry. Answering 504 lets it retry immediately.
+	bool only_if_cached = false;
+
 	// TODO
 	HTTPCookieContainerHandle cookie_container_handle = INVALID_HTTPCOOKIE_HANDLE;
 
