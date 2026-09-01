@@ -632,8 +632,15 @@ void Steam_Game_Coordinator::handle_cs2_loadout_sync(const void *input, uint32 i
     // item in the slot and unequip only whatever OTHER item held the SAME (class,slot);
     // items in unrelated slots are left untouched, so cosmetics survive a weapon-only sync.
     for (const auto &[cls, slot, iid] : entries) {
+        // The CS2 client references items by their NETWORK id ((local<<32)|account),
+        // but our Econ_Item.id is the LOCAL id (the items.json key). Convert so the
+        // match actually hits -- otherwise no item ever matched and the player's
+        // equip choices were never persisted (root cause of "loadout not saved").
+        uint64 local_iid = item_id_network_to_local(iid);
+        PRINT_DEBUG("  2531 entry class=%u slot=%u iid=%llu -> local=%llu", cls, slot, iid, local_iid);
         for (Econ_Item &item : items) {
-            if (item.id == iid) {
+            bool is_target = (item.id == iid) || (item.id == local_iid);
+            if (is_target) {
                 auto it = item.equip_states.find(cls);
                 if (it == item.equip_states.end() || it->second != slot) {
                     item.equip_states[cls] = slot;
