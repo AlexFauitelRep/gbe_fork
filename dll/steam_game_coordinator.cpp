@@ -18,6 +18,7 @@
 #include "dll/steam_game_coordinator.h"
 #include "dll/gbe_cs2_hello_template.h"
 #include "dll/gbe_cs2_store_template.h"
+#include "dll/gbe_cs2_welcome_extra.h"
 #include "dll/dll.h"
 #include <steammessages.pb.h>
 #include <tf2/base_gcmessages.pb.h>
@@ -583,21 +584,32 @@ void Steam_Game_Coordinator::callback_client_welcome()
         CSteamID steam_id = settings->get_local_steam_id();
         load_items_from_file();
         CMsgSOCacheSubscribed cache;
+        // CS2 reads the modern owner_soid (field 4 = CMsgSOIDOwner{type=1,id=steamid}); the
+        // legacy fixed64 owner (field 1) is ignored. Without owner_soid the client can't bind
+        // the cache to the player and the Inventory/Loadout tabs never unlock. Set both.
         cache.set_owner(steam_id.ConvertToUint64());
+        auto so = cache.mutable_owner_soid();
+        so->set_type(1);
+        so->set_id(steam_id.ConvertToUint64());
         cache.set_version(CSGO_SO_CACHE_VERSION);
+
         auto objects = cache.add_objects();
         objects->set_type_id(1);   // CSOEconItem (the skins)
         for (const Econ_Item &item : items)
             objects->add_object_data(item_to_gcprotobuf(item, steam_id));
-        // CS2 requires the CSOEconGameAccountClient (SO type 7) in the cache, otherwise the
-        // econ subsystem never initializes and the Inventory/Loadout tabs stay locked. RevEmu
-        // always ships it; replay the minimal default object it sends.
+        // CSOEconGameAccountClient (SO type 7): the player's econ account object.
         auto acct = cache.add_objects();
-        acct->set_type_id(7);      // CSOEconGameAccountClient
+        acct->set_type_id(7);
         static const unsigned char account_client[] =
             { 0x08, 0x00, 0x65, 0x00, 0x00, 0x00, 0x00, 0x68, 0x00 };
         acct->add_object_data(std::string(
             reinterpret_cast<const char *>(account_client), sizeof(account_client)));
+        // SO type 43 objects captured from RevEmu (account already patched to the local id).
+        auto t43 = cache.add_objects();
+        t43->set_type_id(43);
+        for (unsigned int k = 0; k < CACHE_TYPE43_COUNT; ++k)
+            t43->add_object_data(std::string(
+                reinterpret_cast<const char *>(CACHE_TYPE43_OBJS) + k * 12, 12));
         std::string cache_bytes;
         cache.SerializeToString(&cache_bytes);
 
@@ -605,11 +617,21 @@ void Steam_Game_Coordinator::callback_client_welcome()
             while (v >= 0x80) { s.push_back(static_cast<char>((v & 0x7f) | 0x80)); v >>= 7; }
             s.push_back(static_cast<char>(v));
         };
+        // Full ClientWelcome body matching RevEmu: version(0) + game_data(2) + caches(3) + f5 + f6(hello).
         std::string body;
-        body.push_back(static_cast<char>((1u << 3) | 0u)); put_varint(body, 0u);   // version = 0
-        body.push_back(static_cast<char>((3u << 3) | 2u));                          // field 3 (caches)
+        body.push_back(static_cast<char>((1u << 3) | 0u)); put_varint(body, 0u);   // f1 version = 0
+        body.push_back(static_cast<char>((2u << 3) | 2u));                          // f2 game_data
+        put_varint(body, sizeof(WELCOME_F2_GAMEDATA));
+        body.append(reinterpret_cast<const char *>(WELCOME_F2_GAMEDATA), sizeof(WELCOME_F2_GAMEDATA));
+        body.push_back(static_cast<char>((3u << 3) | 2u));                          // f3 caches
         put_varint(body, cache_bytes.size());
         body += cache_bytes;
+        body.push_back(static_cast<char>((5u << 3) | 2u));                          // f5
+        put_varint(body, sizeof(WELCOME_F5));
+        body.append(reinterpret_cast<const char *>(WELCOME_F5), sizeof(WELCOME_F5));
+        body.push_back(static_cast<char>((6u << 3) | 2u));                          // f6 (embedded hello)
+        put_varint(body, WELCOME_F6_HELLO_LEN);
+        body.append(reinterpret_cast<const char *>(WELCOME_F6_HELLO), WELCOME_F6_HELLO_LEN);
 
         push_bare_gc(msg_type, body);
         send_cs2_matchmaking_hello();
