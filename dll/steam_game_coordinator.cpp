@@ -17,6 +17,7 @@
 
 #include "dll/steam_game_coordinator.h"
 #include "dll/gbe_cs2_hello_template.h"
+#include "dll/gbe_cs2_store_template.h"
 #include "dll/dll.h"
 #include <steammessages.pb.h>
 #include <tf2/base_gcmessages.pb.h>
@@ -562,10 +563,6 @@ void Steam_Game_Coordinator::callback_client_welcome()
     if (!gc_initialized)
         return;
 
-    // CS2/CS:GO: announce "GC connected" (HAVE_SESSION) before the welcome so the econ UI unlocks.
-    if (gc_profile == GC_PROFILE_CSGO)
-        send_cs2_connection_status();
-
     uint32 msg_type = EGCBaseClientMsg::k_EMsgGCClientWelcome | protobuf_mask;
     std::string message = build_protomsg_header(msg_type);
 
@@ -612,6 +609,55 @@ void Steam_Game_Coordinator::send_cs2_matchmaking_hello()
     // connected instead of showing "Ошибка подключения Steam" on the inventory/store.
     message.append(reinterpret_cast<const char *>(REVEMU_9110_TEMPLATE), REVEMU_9110_TEMPLATE_LEN);
 
+    push_incoming(msg_type, message);
+}
+
+// --- CS2/CS:GO econ request responses (captured from a working RevEmu, build 2000885) ---
+// The client sends StoreGetUserData (2500), GetEventFavorites_Request (9201) and
+// ClientGCRankUpdate (9194); until the GC answers each, the econ subsystem stays "not
+// ready" and the Inventory/Loadout tabs refuse to open. We reply exactly like RevEmu.
+
+void Steam_Game_Coordinator::send_cs2_store_userdata()
+{
+    if (!gc_initialized || gc_profile != GC_PROFILE_CSGO)
+        return;
+    uint32 msg_type = 2501u | protobuf_mask;   // k_EMsgGCStoreGetUserDataResponse
+    std::string message = build_protomsg_header(msg_type);
+    message.append(reinterpret_cast<const char *>(GBE_CS2_STORE_2501_BODY),
+                   GBE_CS2_STORE_2501_BODY_LEN);
+    push_incoming(msg_type, message);
+}
+
+void Steam_Game_Coordinator::send_cs2_event_favorites()
+{
+    if (!gc_initialized || gc_profile != GC_PROFILE_CSGO)
+        return;
+    uint32 msg_type = 9203u | protobuf_mask;   // GetEventFavorites_Response
+    std::string message = build_protomsg_header(msg_type);
+    static const unsigned char body[] = { 0x12, 0x02, 0x5B, 0x5D };  // field2 = "[]"
+    message.append(reinterpret_cast<const char *>(body), sizeof(body));
+    push_incoming(msg_type, message);
+}
+
+void Steam_Game_Coordinator::send_cs2_rank_update()
+{
+    if (!gc_initialized || gc_profile != GC_PROFILE_CSGO)
+        return;
+    uint32 msg_type = 9194u | protobuf_mask;   // ClientGCRankUpdate
+    std::string message = build_protomsg_header(msg_type);
+    uint32 account_id = settings->get_local_steam_id().GetAccountID();
+    auto put_varint = [](std::string &s, uint64 v) {
+        while (v >= 0x80) { s.push_back(static_cast<char>((v & 0x7f) | 0x80)); v >>= 7; }
+        s.push_back(static_cast<char>(v));
+    };
+    // CMsgGCCStrike15_v2_ClientGCRankUpdate { rankings[0] = {account_id, rank_id=1, wins=2, rank_type_id=11} }
+    std::string ri;
+    put_varint(ri, (1u << 3) | 0u); put_varint(ri, account_id);
+    put_varint(ri, (2u << 3) | 0u); put_varint(ri, 1u);
+    put_varint(ri, (3u << 3) | 0u); put_varint(ri, 2u);
+    put_varint(ri, (6u << 3) | 0u); put_varint(ri, 11u);
+    put_varint(message, (1u << 3) | 2u); put_varint(message, ri.size());
+    message += ri;
     push_incoming(msg_type, message);
 }
 
@@ -1213,9 +1259,17 @@ EGCResults Steam_Game_Coordinator::SendMessage_( uint32 unMsgType, const void *p
             PRINT_DEBUG("k_EMsgGCSetItemPositions");
             handle_set_multiple_item_pos(pubData, cubData);
             break;
-        case 9194u | protobuf_mask:  // k_EMsgGCCStrike15_v2_MatchmakingClient2GCHello
-            PRINT_DEBUG("CS2 MatchmakingClient2GCHello -> reply MatchmakingGC2ClientHello");
-            send_cs2_matchmaking_hello();
+        case 2500u | protobuf_mask:  // k_EMsgGCStoreGetUserData
+            PRINT_DEBUG("CS2 StoreGetUserData -> reply StoreGetUserDataResponse(2501)");
+            send_cs2_store_userdata();
+            break;
+        case 9201u | protobuf_mask:  // GetEventFavorites_Request
+            PRINT_DEBUG("CS2 GetEventFavorites_Request -> reply 9203");
+            send_cs2_event_favorites();
+            break;
+        case 9194u | protobuf_mask:  // ClientGCRankUpdate
+            PRINT_DEBUG("CS2 ClientGCRankUpdate -> reply 9194 rankings");
+            send_cs2_rank_update();
             break;
         default:
             break;

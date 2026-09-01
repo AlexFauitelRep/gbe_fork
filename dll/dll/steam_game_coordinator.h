@@ -112,6 +112,9 @@ public ISteamGameCoordinator
     void callback_server_welcome();
     void send_cs2_matchmaking_hello();
     void send_cs2_connection_status();
+    void send_cs2_store_userdata();
+    void send_cs2_event_favorites();
+    void send_cs2_rank_update();
     void callback_items_received(CSteamID steam_id, const std::vector<Econ_Item> &items);
     void callback_items_removed(CSteamID steam_id);
     void callback_item_updated(CSteamID steam_id, const Econ_Item &item);
