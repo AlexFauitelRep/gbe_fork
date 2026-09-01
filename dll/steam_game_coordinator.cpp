@@ -513,6 +513,138 @@ void Steam_Game_Coordinator::handle_adjust_equip_state(const void *input, uint32
     save_items_to_file();
 }
 
+// CS2 (unlike TF2's 1059) syncs the player's equipped loadout via GC message 2531:
+//   repeated field 1 { 1=class(2=T,3=CT), 2=slot, 3=item_id }   (+ field 2 = count)
+// It is the FULL authoritative snapshot of what is equipped, sent whenever the
+// player changes their loadout in the menu.  gbe previously ignored it, so the
+// user's menu selection never reached the shared-object cache and was lost on
+// exit -> the equipment screen showed defaults on the next launch.  Here we parse
+// it by hand (there is no generated CS2 proto) and rebuild every item's
+// equip_states from the snapshot, then persist to items.json.  Because it is a
+// full snapshot, any item NOT named for a slot becomes unequipped, so two members
+// of a variant pair (Deagle/R8, ...) can no longer both stay equipped in a slot.
+void Steam_Game_Coordinator::handle_cs2_loadout_sync(const void *input, uint32 input_size)
+{
+    if (is_server)
+        return;
+
+    const char *p = reinterpret_cast<const char *>(input);
+    const char *end = p + input_size;
+    if (input_size < sizeof(ProtoBufMsgHeader_t))
+        return;
+
+    // Skip the ProtoBufMsgHeader_t and the (usually empty) CMsgProtoBufHeader.
+    ProtoBufMsgHeader_t hdr = deser_var<ProtoBufMsgHeader_t>(p);
+    p += hdr.m_cubProtoBufExtHdr;
+    if (p < reinterpret_cast<const char *>(input) || p > end)
+        return;
+
+    auto read_varint = [&](const char *&q) -> uint64 {
+        uint64 result = 0;
+        int shift = 0;
+        while (q < end && shift < 64) {
+            uint8 b = static_cast<uint8>(*q++);
+            result |= static_cast<uint64>(b & 0x7f) << shift;
+            if (!(b & 0x80))
+                break;
+            shift += 7;
+        }
+        return result;
+    };
+
+    std::map<uint64, std::map<uint16, uint16>> desired; // item_id -> (class -> slot)
+    while (p < end) {
+        uint64 tag = read_varint(p);
+        uint32 field = static_cast<uint32>(tag >> 3);
+        uint32 wire = static_cast<uint32>(tag & 7);
+        if (field == 1 && wire == 2) {
+            uint64 len = read_varint(p);
+            const char *sub = p;
+            const char *sub_end = p + len;
+            if (sub_end > end || sub_end < p)
+                break;
+            p = sub_end;
+
+            uint32 cls = 0, slot = 0;
+            uint64 item_id = 0;
+            const char *q = sub;
+            while (q < sub_end) {
+                uint64 t2 = read_varint(q);
+                uint32 f2 = static_cast<uint32>(t2 >> 3);
+                uint32 w2 = static_cast<uint32>(t2 & 7);
+                if (w2 == 0) {
+                    uint64 v = read_varint(q);
+                    if (f2 == 1) cls = static_cast<uint32>(v);
+                    else if (f2 == 2) slot = static_cast<uint32>(v);
+                    else if (f2 == 3) item_id = v;
+                } else if (w2 == 2) {
+                    uint64 l = read_varint(q); q += l;
+                } else if (w2 == 5) {
+                    q += 4;
+                } else if (w2 == 1) {
+                    q += 8;
+                } else {
+                    break;
+                }
+            }
+            if (item_id)
+                desired[item_id][static_cast<uint16>(cls)] = static_cast<uint16>(slot);
+        } else if (wire == 0) {
+            read_varint(p);
+        } else if (wire == 2) {
+            uint64 l = read_varint(p); p += l;
+        } else if (wire == 5) {
+            p += 4;
+        } else if (wire == 1) {
+            p += 8;
+        } else {
+            break;
+        }
+    }
+
+    PRINT_DEBUG("CS2 loadout sync: %zu equipped entries", desired.size());
+
+    bool any_changed = false;
+    for (Econ_Item &item : items) {
+        std::map<uint16, uint16> new_state;
+        auto it = desired.find(item.id);
+        if (it != desired.end())
+            new_state = it->second;
+
+        if (item.equip_states == new_state)
+            continue;
+
+        item.equip_states = new_state;
+        any_changed = true;
+
+        // Echo the update so the client shared-object cache stays authoritative
+        // (mirrors handle_adjust_equip_state).
+        auto inventory_msg = new GameServer_Items_Messages::ItemUpdate();
+        inventory_msg->set_id(item.id);
+        inventory_msg->set_has_equip_states(true);
+        for (const auto &[class_id, slot_id] : item.equip_states) {
+            auto new_st = inventory_msg->add_equip_states();
+            new_st->set_class_id(class_id);
+            new_st->set_slot_id(slot_id);
+        }
+
+        auto gameserver_items_msg = new GameServer_Items_Messages();
+        gameserver_items_msg->set_type(GameServer_Items_Messages::Request_UpdateItem);
+        gameserver_items_msg->set_is_gc(true);
+        gameserver_items_msg->set_allocated_item_update(inventory_msg);
+
+        Common_Message msg{};
+        msg.set_allocated_gameserver_items_messages(gameserver_items_msg);
+        msg.set_source_id(settings->get_local_steam_id().ConvertToUint64());
+        network->sendToAll(&msg, true);
+
+        callback_item_updated(settings->get_local_steam_id(), item);
+    }
+
+    if (any_changed)
+        save_items_to_file();
+}
+
 void Steam_Game_Coordinator::handle_set_multiple_item_pos(const void *input, uint32 input_size)
 {
     if (is_server)
@@ -1331,6 +1463,10 @@ EGCResults Steam_Game_Coordinator::SendMessage_( uint32 unMsgType, const void *p
         case 9194u | protobuf_mask:  // ClientGCRankUpdate
             PRINT_DEBUG("CS2 ClientGCRankUpdate -> reply 9194 rankings");
             send_cs2_rank_update();
+            break;
+        case 2531u | protobuf_mask:  // CS2 loadout sync (client's full equipped loadout)
+            PRINT_DEBUG("CS2 loadout sync (2531) -> persist equip_states");
+            handle_cs2_loadout_sync(pubData, cubData);
             break;
         default: {
             // Capture unhandled client->GC messages (e.g. CS2 loadout/equip flow) so we can

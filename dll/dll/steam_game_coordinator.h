@@ -111,6 +111,7 @@ public ISteamGameCoordinator
     void handle_respawn(const void *input, uint32 input_size);
     void handle_set_item_style(const void *input, uint32 input_size);
     void handle_adjust_equip_state(const void *input, uint32 input_size);
+    void handle_cs2_loadout_sync(const void *input, uint32 input_size);
     void handle_set_multiple_item_pos(const void *input, uint32 input_size);
 
     void callback_client_welcome();
