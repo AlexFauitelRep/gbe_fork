@@ -229,15 +229,7 @@ bool Steam_HTTP::SetHTTPRequestHeaderValue( HTTPRequestHandle hRequest, const ch
     // FIX: appid 1902490 adds the header "Cache-Control: only-if-cached, max-stale=2678400"
     // which means a response is returned back only if it was already cached, otherwise the server has to send a 504 "Gateway Timeout"
     // just bypass the known ones to be on the safe side
-    if (common_helpers::str_cmp_insensitive(pchHeaderName, "Cache-Control")) {
-        // Remember the only-if-cached intent so SendHTTPRequest can honor the 504 contract.
-        // CS2's SDR-config fetch waits ~60s if we answer a fake 200 to an only-if-cached request.
-        // Steam always sends this token lowercase (e.g. "only-if-cached, max-stale=2678400").
-        if (std::string(pchHeaderValue).find("only-if-cached") != std::string::npos) {
-            request->only_if_cached = true;
-        }
-        return true;
-    }
+    if (common_helpers::str_cmp_insensitive(pchHeaderName, "Cache-Control")) return true;
     if (common_helpers::str_cmp_insensitive(pchHeaderName, "Accept")) return true;
 
     request->headers[pchHeaderName] = pchHeaderValue;
@@ -495,24 +487,6 @@ bool Steam_HTTP::SendHTTPRequest( HTTPRequestHandle hRequest, SteamAPICall_t *pC
     switch (request->protocol)
     {
     case Steam_Http_Request::Protocol_t::Web: {
-        // Honor the only-if-cached contract: we are not a real HTTP cache, so report 504 "cache miss".
-        // This is what CS2's SteamNetworkingSockets SDR-config fetch expects; a fake 200 here makes it
-        // ignore the body and stall ~60s before issuing the real (non-cached) request. With a 504 it
-        // retries immediately, and that retry (no only-if-cached header) gets served the local file.
-        if (request->only_if_cached) {
-            struct HTTPRequestCompleted_t data{};
-            data.m_hRequest = request->handle;
-            data.m_ulContextValue = request->context_value;
-            data.m_unBodySize = 0;
-            data.m_bRequestSuccessful = false;
-            data.m_eStatusCode = k_EHTTPStatusCode504GatewayTimeout;
-
-            request->response.clear(); // don't expose a body for a "cache miss"
-            auto callres = callback_results->addCallResult(data.k_iCallback, &data, sizeof(data), 0.03);
-            if (pCallHandle) *pCallHandle = callres;
-            callbacks->addCBResult(data.k_iCallback, &data, sizeof(data), 0.03);
-            break;
-        }
         bool bad_local_file = request->response.empty() && !request->target_filepath.empty(); // we need the filepath since we want to save the response to that file
         bool internet_allowed = !settings->disable_networking && settings->download_steamhttp_requests;
         if (bad_local_file && internet_allowed) {
