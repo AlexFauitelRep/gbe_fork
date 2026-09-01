@@ -1129,6 +1129,16 @@ int Steam_User::GetSteamTicket( void *pBlob, int cbMaxBlob )
 
 void Steam_User::RunCallbacks()
 {
+    // Wake up the modern client's callback pump: CS2 blocks econ/GameCoordinator init until it
+    // receives SteamServersConnected_t. Post it once, shortly after startup, for the client only
+    // (the game server issues its own from steam_gameserver). Without this CS2 stalls ~60-70s.
+    if (!is_server && !sent_servers_connected && !settings->is_offline() && check_timedout(created_time, 1.0)) {
+        PRINT_DEBUG("posting SteamServersConnected_t (client)");
+        SteamServersConnected_t data{};
+        callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
+        sent_servers_connected = true;
+    }
+
     if (callbacks_old1) {
         if (call_logged_on && check_timedout(logon_time, 0.1)) {
             PRINT_DEBUG("ICMCallback -> OnLogonSuccess");

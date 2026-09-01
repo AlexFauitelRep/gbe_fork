@@ -69,6 +69,13 @@ public ISteamUser
     std::chrono::high_resolution_clock::time_point logoff_time{};
     std::vector<std::pair<CSteamID, std::chrono::high_resolution_clock::time_point>> player_auths{};
 
+    // The modern SteamUser interface (CS2) waits for SteamServersConnected_t before it starts
+    // pumping Steam callbacks / initializing the econ (GameCoordinator) subsystem. gbe only ever
+    // issued the legacy ICMCallback OnLogonSuccess, never SteamServersConnected_t for the client,
+    // so CS2 sat ~60-70s on an internal timeout before continuing. Send it once at startup.
+    bool sent_servers_connected{};
+    std::chrono::high_resolution_clock::time_point created_time = std::chrono::high_resolution_clock::now();
+
 public:
     Steam_User(Settings *settings, Local_Storage *local_storage, class Networking *network, class SteamCallResults *callback_results, class SteamCallBacks *callbacks, bool is_server);
     ~Steam_User();
