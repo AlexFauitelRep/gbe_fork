@@ -729,13 +729,34 @@ void Steam_Game_Coordinator::callback_client_welcome()
         objects->set_type_id(1);   // CSOEconItem (the skins)
         for (const Econ_Item &item : items)
             objects->add_object_data(item_to_gcprotobuf(item, steam_id));
+        auto pv = [](std::string &s, uint64 v) {
+            while (v >= 0x80) { s.push_back(static_cast<char>((v & 0x7f) | 0x80)); v >>= 7; }
+            s.push_back(static_cast<char>(v));
+        };
         // CSOEconGameAccountClient (SO type 7): the player's econ account object.
+        // Prime status = elevated_state (field 14) = 5 (0 means non-Prime), with a
+        // nonzero elevated_timestamp (field 15).  base_gcmessages.proto.
         auto acct = cache.add_objects();
         acct->set_type_id(7);
-        static const unsigned char account_client[] =
-            { 0x08, 0x00, 0x65, 0x00, 0x00, 0x00, 0x00, 0x68, 0x00 };
-        acct->add_object_data(std::string(
-            reinterpret_cast<const char *>(account_client), sizeof(account_client)));
+        {
+            std::string ac;
+            pv(ac, (1u << 3) | 0u);  pv(ac, 0u);            // additional_backpack_slots
+            ac.push_back(static_cast<char>((12u << 3) | 5u)); ac.append(4, '\0'); // bonus_xp_timestamp_refresh (fixed32)
+            pv(ac, (13u << 3) | 0u); pv(ac, 0u);            // bonus_xp_usedflags
+            pv(ac, (14u << 3) | 0u); pv(ac, 5u);            // elevated_state = 5 (PRIME)
+            pv(ac, (15u << 3) | 0u); pv(ac, 1735689600u);   // elevated_timestamp (nonzero)
+            acct->add_object_data(ac);
+        }
+        // CSOPersonaDataPublic (SO type 2): the public badge -> player level + Prime.
+        // cstrike15_gcmessages.proto: player_level=1 (int32), elevated_state=3 (bool).
+        {
+            auto persona = cache.add_objects();
+            persona->set_type_id(2);
+            std::string pd;
+            pv(pd, (1u << 3) | 0u); pv(pd, 39u);            // player_level = 39 (max badge w/o reset prompt)
+            pv(pd, (3u << 3) | 0u); pv(pd, 1u);             // elevated_state = true (Prime)
+            persona->add_object_data(pd);
+        }
         // SO type 43 objects captured from RevEmu (account already patched to the local id).
         auto t43 = cache.add_objects();
         t43->set_type_id(43);
@@ -801,6 +822,29 @@ void Steam_Game_Coordinator::send_cs2_matchmaking_hello()
     put_varint(body, (1u << 3) | 0u);           // field 1 = account_id
     put_varint(body, account_id);
     body.append(reinterpret_cast<const char *>(REVEMU_9110_TEMPLATE), REVEMU_9110_TEMPLATE_LEN);
+
+    // Max profile level so the account shows fully leveled. player_level=39 +
+    // player_cur_xp=4999 is the top of the badge without triggering the level-40
+    // Service-Medal conversion prompt (cstrike15_gcmessages.proto fields 17/18).
+    put_varint(body, (17u << 3) | 0u); put_varint(body, 39u);    // player_level
+    put_varint(body, (18u << 3) | 0u); put_varint(body, 4999u);  // player_cur_xp
+
+    // Max rank for every mode (field 20 = repeated PlayerRankingInfo).
+    // rank_type_id: 6=competitive, 7=wingman, 10=danger zone, 11=premier(CS Rating).
+    auto add_rank = [&](uint32 rank_id, uint32 rank_type_id, uint32 wins) {
+        std::string ri;
+        put_varint(ri, (1u << 3) | 0u); put_varint(ri, account_id);
+        put_varint(ri, (2u << 3) | 0u); put_varint(ri, rank_id);
+        put_varint(ri, (3u << 3) | 0u); put_varint(ri, wins);
+        put_varint(ri, (6u << 3) | 0u); put_varint(ri, rank_type_id);
+        put_varint(body, (20u << 3) | 2u); put_varint(body, ri.size());
+        body += ri;
+    };
+    add_rank(18u, 6u, 5000u);      // competitive: The Global Elite
+    add_rank(18u, 7u, 2000u);      // wingman:    The Global Elite
+    add_rank(15u, 10u, 1000u);     // danger zone: Howling Alpha
+    add_rank(30000u, 11u, 1000u);  // premier:    high CS Rating
+
     push_bare_gc(msg_type, body);
 }
 
@@ -836,15 +880,22 @@ void Steam_Game_Coordinator::send_cs2_rank_update()
         while (v >= 0x80) { s.push_back(static_cast<char>((v & 0x7f) | 0x80)); v >>= 7; }
         s.push_back(static_cast<char>(v));
     };
-    // CMsgGCCStrike15_v2_ClientGCRankUpdate { rankings[0] = {account_id, rank_id=1, wins=2, rank_type_id=11} }
-    std::string ri;
-    put_varint(ri, (1u << 3) | 0u); put_varint(ri, account_id);
-    put_varint(ri, (2u << 3) | 0u); put_varint(ri, 1u);
-    put_varint(ri, (3u << 3) | 0u); put_varint(ri, 2u);
-    put_varint(ri, (6u << 3) | 0u); put_varint(ri, 11u);
+    // CMsgGCCStrike15_v2_ClientGCRankUpdate { rankings = repeated PlayerRankingInfo }
+    // Max rank per mode (6=competitive,7=wingman,10=danger zone,11=premier CS Rating).
     std::string body;
-    put_varint(body, (1u << 3) | 2u); put_varint(body, ri.size());
-    body += ri;
+    auto add_rank = [&](uint32 rank_id, uint32 rank_type_id, uint32 wins) {
+        std::string ri;
+        put_varint(ri, (1u << 3) | 0u); put_varint(ri, account_id);
+        put_varint(ri, (2u << 3) | 0u); put_varint(ri, rank_id);
+        put_varint(ri, (3u << 3) | 0u); put_varint(ri, wins);
+        put_varint(ri, (6u << 3) | 0u); put_varint(ri, rank_type_id);
+        put_varint(body, (1u << 3) | 2u); put_varint(body, ri.size());
+        body += ri;
+    };
+    add_rank(18u, 6u, 5000u);
+    add_rank(18u, 7u, 2000u);
+    add_rank(15u, 10u, 1000u);
+    add_rank(30000u, 11u, 1000u);
     push_bare_gc(9194u | protobuf_mask, body);   // ClientGCRankUpdate
 }
 
