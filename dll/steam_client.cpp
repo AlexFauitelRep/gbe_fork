@@ -42,18 +42,14 @@ void Steam_Client::background_thread_proc()
     // if our time exceeds last run time of callbacks and it wasn't processing already
     const auto runcallbacks_timeout_ms = last_cb_run + max_stall_ms.count();
     if (!cb_run_active && (now_ms >= runcallbacks_timeout_ms)) {
+        std::lock_guard lock(global_mutex);
+
         PRINT_DEBUG("run @@@@@@@@@@@@@@@@@@@@@@@@@@@");
-        // The game may not pump Steam callbacks itself for a while (CS2 doesn't call
-        // SteamAPI_ManualDispatch_GetNextCallback for ~60s during its engine/panorama load). The old
-        // fallback only ran networking + run_every_runcb, which does NOT deliver client call results
-        // (cert via GetCertAsync -> SteamNetworkingSocketsCert_t, SDR-config HTTP completion, etc.).
-        // Those results carry registered CCallResult handlers, so runCallResults() invokes them
-        // directly (bypassing the not-yet-running dispatch queue), which is exactly what lets the
-        // client's networking reach AuthStatus=OK and start econ init. Without this, CS2 sat ~60s
-        // waiting for a cert/config that gbe had ready since second ~9. Run the full client dispatch.
-        // RunCallbacks takes global_mutex itself and must NOT be called while we hold it (it unlocks
-        // around each callback), so don't wrap this in a lock here.
-        RunCallbacks(true, IsServerInit());
+        network->Run(); // networking must run first since it receives messages used by each run_callback()
+        run_every_runcb->run(); // call each run_callback()
+
+        // update the time counter to avoid overlap
+        last_cb_run = (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     }
 
     if (settings_client->record_playtime) {
