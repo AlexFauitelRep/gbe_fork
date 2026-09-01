@@ -1332,8 +1332,20 @@ EGCResults Steam_Game_Coordinator::SendMessage_( uint32 unMsgType, const void *p
             PRINT_DEBUG("CS2 ClientGCRankUpdate -> reply 9194 rankings");
             send_cs2_rank_update();
             break;
-        default:
+        default: {
+            // Capture unhandled client->GC messages (e.g. CS2 loadout/equip flow) so we can
+            // reverse-engineer them. Dump a hex preview of the payload into the debug log.
+            std::string hex;
+            const unsigned char *p = reinterpret_cast<const unsigned char *>(pubData);
+            char buf[4];
+            for (uint32 i = 0; i < cubData && i < 300; ++i) {
+                snprintf(buf, sizeof(buf), "%02x", p[i]);
+                hex += buf;
+            }
+            PRINT_DEBUG("CS2 UNHANDLED GC msg 0x%08X (%u) len %u payload: %s",
+                        unMsgType, (~protobuf_mask) & unMsgType, cubData, hex.c_str());
             break;
+        }
     }
 
     return k_EGCResultOK;
