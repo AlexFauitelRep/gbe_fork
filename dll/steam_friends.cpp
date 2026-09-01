@@ -1409,9 +1409,25 @@ void Steam_Friends::ActivateGameOverlayInviteDialogConnectString( const char *pc
 STEAM_CALL_RESULT( EquippedProfileItems_t )
 SteamAPICall_t Steam_Friends::RequestEquippedProfileItems( CSteamID steamID )
 {
-    PRINT_DEBUG_TODO();
+    PRINT_DEBUG("%llu", steamID.ConvertToUint64());
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
-    return 0;
+    // CS2 calls this during startup and BLOCKS its econ/GameCoordinator initialization until the
+    // EquippedProfileItems_t result arrives. The old stub returned 0 and never posted a callback,
+    // so CS2 waited out its ~50s internal timeout before continuing -> very slow load into the menu.
+    // Reply immediately with an empty (no equipped profile items) result, like RevEmu does.
+    EquippedProfileItems_t data{};
+    data.m_eResult = k_EResultOK;
+    data.m_steamID = steamID;
+    data.m_bHasAnimatedAvatar = false;
+    data.m_bHasAvatarFrame = false;
+    data.m_bHasProfileModifier = false;
+    data.m_bHasProfileBackground = false;
+    data.m_bHasMiniProfileBackground = false;
+    data.m_bFromCache = false;
+
+    auto ret = callback_results->addCallResult(data.k_iCallback, &data, sizeof(data));
+    callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
+    return ret;
 }
 
 bool Steam_Friends::BHasEquippedProfileItem( CSteamID steamID, ECommunityProfileItemType itemType )
