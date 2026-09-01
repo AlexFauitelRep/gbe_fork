@@ -558,27 +558,28 @@ void Steam_Game_Coordinator::send_cs2_connection_status()
     push_incoming(msg_type, message);
 }
 
+// Bare GC message: [msg_type_flagged(4 LE)][header_len=0(4 LE)][body], no CMsgProtoBufHeader.
+void Steam_Game_Coordinator::push_bare_gc(uint32 msg_type_flagged, const std::string &body)
+{
+    std::string message;
+    uint32 t = msg_type_flagged;
+    uint32 zero = 0;
+    message.append(reinterpret_cast<const char *>(&t), sizeof(t));
+    message.append(reinterpret_cast<const char *>(&zero), sizeof(zero));
+    message += body;
+    push_incoming(msg_type_flagged, message);
+}
+
 void Steam_Game_Coordinator::callback_client_welcome()
 {
     if (!gc_initialized)
         return;
 
     uint32 msg_type = EGCBaseClientMsg::k_EMsgGCClientWelcome | protobuf_mask;
-    std::string message = build_protomsg_header(msg_type);
 
-    CMsgClientWelcome protomsg;
-    // CS2/CS:GO treats a welcome/cache with version 0 as unsubscribed (default icons),
-    // so advertise a non-zero version for that profile only. TF2 keeps its original 0.
-    protomsg.set_version(gc_profile == GC_PROFILE_CSGO ? static_cast<uint32>(CSGO_SO_CACHE_VERSION) : 0);
-
-    protomsg.AppendToString(&message);
-
-    // CS2/CS:GO: RevEmu embeds the econ SO cache *inside* the welcome (field 3,
-    // outofdate_subscribed_caches). The client only marks its econ subsystem "ready"
-    // (and unlocks the Inventory/Loadout tabs) when the welcome itself carries the cache;
-    // a standalone SOCacheSubscribed (24) is not enough. gbe's trimmed CMsgClientWelcome
-    // proto has no caches field, so hand-append field 3 = the serialized CMsgSOCacheSubscribed.
     if (gc_profile == GC_PROFILE_CSGO) {
+        // Match RevEmu byte-for-byte: bare welcome, version 0, with the econ SO cache
+        // embedded (field 3 = outofdate_subscribed_caches). No standalone SOCacheSubscribed.
         CSteamID steam_id = settings->get_local_steam_id();
         load_items_from_file();
         CMsgSOCacheSubscribed cache;
@@ -590,20 +591,28 @@ void Steam_Game_Coordinator::callback_client_welcome()
             objects->add_object_data(item_to_gcprotobuf(item, steam_id));
         std::string cache_bytes;
         cache.SerializeToString(&cache_bytes);
+
         auto put_varint = [](std::string &s, uint64 v) {
             while (v >= 0x80) { s.push_back(static_cast<char>((v & 0x7f) | 0x80)); v >>= 7; }
             s.push_back(static_cast<char>(v));
         };
-        message.push_back(static_cast<char>((3u << 3) | 2u));   // field 3, length-delimited
-        put_varint(message, cache_bytes.size());
-        message += cache_bytes;
+        std::string body;
+        body.push_back(static_cast<char>((1u << 3) | 0u)); put_varint(body, 0u);   // version = 0
+        body.push_back(static_cast<char>((3u << 3) | 2u));                          // field 3 (caches)
+        put_varint(body, cache_bytes.size());
+        body += cache_bytes;
+
+        push_bare_gc(msg_type, body);
+        send_cs2_matchmaking_hello();
+        return;
     }
 
+    // TF2 / other: original framed welcome.
+    std::string message = build_protomsg_header(msg_type);
+    CMsgClientWelcome protomsg;
+    protomsg.set_version(0);
+    protomsg.AppendToString(&message);
     push_incoming(msg_type, message);
-
-    // CS2/CS:GO only: also announce the GC as connected (see send_cs2_matchmaking_hello).
-    if (gc_profile == GC_PROFILE_CSGO)
-        send_cs2_matchmaking_hello();
 }
 
 // CS2/CS:GO: the client repeatedly sends MatchmakingClient2GCHello (9194) and, until it
@@ -619,24 +628,17 @@ void Steam_Game_Coordinator::send_cs2_matchmaking_hello()
     if (!gc_initialized || gc_profile != GC_PROFILE_CSGO)
         return;
 
-    constexpr uint32 k_EMsgGCCStrike15_v2_MatchmakingGC2ClientHello = 9110;
-    uint32 msg_type = k_EMsgGCCStrike15_v2_MatchmakingGC2ClientHello | protobuf_mask;
-    std::string message = build_protomsg_header(msg_type);
-
+    uint32 msg_type = 9110u | protobuf_mask;  // MatchmakingGC2ClientHello
     uint32 account_id = settings->get_local_steam_id().GetAccountID();
     auto put_varint = [](std::string &s, uint64 v) {
         while (v >= 0x80) { s.push_back(static_cast<char>((v & 0x7f) | 0x80)); v >>= 7; }
         s.push_back(static_cast<char>(v));
     };
-    // CMsgGCCStrike15_v2_MatchmakingGC2ClientHello, field 1 = account_id (varint).
-    put_varint(message, (1u << 3) | 0u);
-    put_varint(message, account_id);
-    // Append the rest of a real hello (field 3 global_stats + field 6 vac_banned=0)
-    // captured from RevEmu, so the client sees a complete hello and treats the GC as
-    // connected instead of showing "Ошибка подключения Steam" on the inventory/store.
-    message.append(reinterpret_cast<const char *>(REVEMU_9110_TEMPLATE), REVEMU_9110_TEMPLATE_LEN);
-
-    push_incoming(msg_type, message);
+    std::string body;
+    put_varint(body, (1u << 3) | 0u);           // field 1 = account_id
+    put_varint(body, account_id);
+    body.append(reinterpret_cast<const char *>(REVEMU_9110_TEMPLATE), REVEMU_9110_TEMPLATE_LEN);
+    push_bare_gc(msg_type, body);
 }
 
 // --- CS2/CS:GO econ request responses (captured from a working RevEmu, build 2000885) ---
@@ -648,30 +650,24 @@ void Steam_Game_Coordinator::send_cs2_store_userdata()
 {
     if (!gc_initialized || gc_profile != GC_PROFILE_CSGO)
         return;
-    uint32 msg_type = 2501u | protobuf_mask;   // k_EMsgGCStoreGetUserDataResponse
-    std::string message = build_protomsg_header(msg_type);
-    message.append(reinterpret_cast<const char *>(GBE_CS2_STORE_2501_BODY),
-                   GBE_CS2_STORE_2501_BODY_LEN);
-    push_incoming(msg_type, message);
+    std::string body(reinterpret_cast<const char *>(GBE_CS2_STORE_2501_BODY),
+                     GBE_CS2_STORE_2501_BODY_LEN);
+    push_bare_gc(2501u | protobuf_mask, body);   // k_EMsgGCStoreGetUserDataResponse
 }
 
 void Steam_Game_Coordinator::send_cs2_event_favorites()
 {
     if (!gc_initialized || gc_profile != GC_PROFILE_CSGO)
         return;
-    uint32 msg_type = 9203u | protobuf_mask;   // GetEventFavorites_Response
-    std::string message = build_protomsg_header(msg_type);
-    static const unsigned char body[] = { 0x12, 0x02, 0x5B, 0x5D };  // field2 = "[]"
-    message.append(reinterpret_cast<const char *>(body), sizeof(body));
-    push_incoming(msg_type, message);
+    static const unsigned char body_bytes[] = { 0x12, 0x02, 0x5B, 0x5D };  // field2 = "[]"
+    std::string body(reinterpret_cast<const char *>(body_bytes), sizeof(body_bytes));
+    push_bare_gc(9203u | protobuf_mask, body);   // GetEventFavorites_Response
 }
 
 void Steam_Game_Coordinator::send_cs2_rank_update()
 {
     if (!gc_initialized || gc_profile != GC_PROFILE_CSGO)
         return;
-    uint32 msg_type = 9194u | protobuf_mask;   // ClientGCRankUpdate
-    std::string message = build_protomsg_header(msg_type);
     uint32 account_id = settings->get_local_steam_id().GetAccountID();
     auto put_varint = [](std::string &s, uint64 v) {
         while (v >= 0x80) { s.push_back(static_cast<char>((v & 0x7f) | 0x80)); v >>= 7; }
@@ -683,9 +679,10 @@ void Steam_Game_Coordinator::send_cs2_rank_update()
     put_varint(ri, (2u << 3) | 0u); put_varint(ri, 1u);
     put_varint(ri, (3u << 3) | 0u); put_varint(ri, 2u);
     put_varint(ri, (6u << 3) | 0u); put_varint(ri, 11u);
-    put_varint(message, (1u << 3) | 2u); put_varint(message, ri.size());
-    message += ri;
-    push_incoming(msg_type, message);
+    std::string body;
+    put_varint(body, (1u << 3) | 2u); put_varint(body, ri.size());
+    body += ri;
+    push_bare_gc(9194u | protobuf_mask, body);   // ClientGCRankUpdate
 }
 
 void Steam_Game_Coordinator::callback_server_welcome()
@@ -707,6 +704,12 @@ void Steam_Game_Coordinator::callback_server_welcome()
 void Steam_Game_Coordinator::callback_items_received(CSteamID steam_id, const std::vector<Econ_Item> &items)
 {
     if (!gc_initialized)
+        return;
+
+    // CS2/CS:GO: the SO cache is delivered inside the ClientWelcome (see callback_client_welcome);
+    // RevEmu sends no standalone SOCacheSubscribed. A duplicate would re-subscribe the cache and
+    // can confuse the client's econ state, so skip it for this profile.
+    if (gc_profile == GC_PROFILE_CSGO)
         return;
 
     if (gc_version < 20110414) {

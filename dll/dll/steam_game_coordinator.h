@@ -89,6 +89,11 @@ public ISteamGameCoordinator
     void parse_gc_config();
     bool is_welcome_message(const GC_Message &message);
     void push_incoming(uint32 msg_type, const std::string &message, double delay = 0.1);
+    // CS2/CS:GO: RevEmu delivers GC->client messages "bare" ([msg_type][header_len=0][body])
+    // with NO CMsgProtoBufHeader. gbe's build_protomsg_header adds a 32-byte header (client
+    // steam id, session, nil job ids) which the CS2 client's econ path does not accept for
+    // these messages -> Inventory/Loadout tabs stay locked. This pushes a bare message.
+    void push_bare_gc(uint32 msg_type_flagged, const std::string &body);
 
     std::string build_msg_header(JobID_t target_job = k_GIDNil, JobID_t source_job = k_GIDNil);
     GCMsgHdrEx_t parse_msg_header(const char *&p);
