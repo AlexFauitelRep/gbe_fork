@@ -312,7 +312,12 @@ std::string Steam_Game_Coordinator::item_to_gcstruct(const Econ_Item &item, CSte
 std::string Steam_Game_Coordinator::item_to_gcprotobuf(const Econ_Item &item, CSteamID steam_id)
 {
     CSOEconItem proto_item;
-    proto_item.set_id(item.id);
+    // CS2 client uses CSOEconItem.id verbatim as the full 64-bit item id and writes
+    // that SAME id into cs2_preferred_items.txt. It must therefore be the composed
+    // (serial<<32)|account form (like csgo_gc), NOT the bare local serial -- otherwise
+    // the client composes a network id for its loadout that never resolves back to the
+    // bare-serial SO-cache item, and the equipped loadout silently reverts to default.
+    proto_item.set_id(item_id_local_to_network(item.id));
     proto_item.set_account_id(steam_id.GetAccountID());
     proto_item.set_inventory(item.inv_pos);
     proto_item.set_def_index(item.def);
@@ -1538,6 +1543,18 @@ EGCResults Steam_Game_Coordinator::SendMessage_( uint32 unMsgType, const void *p
         case 2531u | protobuf_mask:  // CS2 loadout sync (client's full equipped loadout)
             PRINT_DEBUG("CS2 loadout sync (2531) -> persist equip_states");
             handle_cs2_loadout_sync(pubData, cubData);
+            break;
+        case 4006u | protobuf_mask:  // k_EMsgGCClientHello
+        case 4006u:
+            // Deliver the ClientWelcome + SO cache SYNCHRONOUSLY in response to the
+            // client's hello (like csgo_gc's OnClientHello / a real GC), so the SO
+            // cache with equipped_state is in the queue the moment the client polls
+            // it -- the menu loadout screen reads the cache instead of falling back
+            // to defaults. gbe's proactive gc_init welcome fires before the client
+            // even says hello, which the client ignores.
+            PRINT_DEBUG("CS2 GC ClientHello (4006) -> (re)send ClientWelcome + hello");
+            callback_client_welcome();
+            send_cs2_matchmaking_hello();
             break;
         default: {
             // Capture unhandled client->GC messages (e.g. CS2 loadout/equip flow) so we can
