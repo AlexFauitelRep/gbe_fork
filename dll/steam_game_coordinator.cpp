@@ -532,10 +532,39 @@ void Steam_Game_Coordinator::handle_set_multiple_item_pos(const void *input, uin
     save_items_to_file();
 }
 
+// CS2/CS:GO: k_EMsgGCClientConnectionStatus (4009) with status = GCConnectionStatus_HAVE_SESSION (0).
+// This is the message that flips the client's "GC connected" flag. Without it the econ UI treats the
+// Game Coordinator as disconnected and the Inventory/Loadout tabs refuse to open ("Ошибка подключения
+// Steam"), even though the ClientWelcome + SO cache were delivered. RevEmu sends this (reverse-engineered
+// via SteamClientProxy's Dota GCConnectionStatus injection); we emit it for the CS:GO profile.
+void Steam_Game_Coordinator::send_cs2_connection_status()
+{
+    if (!gc_initialized || gc_profile != GC_PROFILE_CSGO)
+        return;
+
+    constexpr uint32 k_EMsgGCClientConnectionStatus = 4009;
+    uint32 msg_type = k_EMsgGCClientConnectionStatus | protobuf_mask;
+    std::string message = build_protomsg_header(msg_type);
+
+    // CMsgConnectionStatus: field 1 = status (GCConnectionStatus_HAVE_SESSION = 0).
+    auto put_varint = [](std::string &s, uint64 v) {
+        while (v >= 0x80) { s.push_back(static_cast<char>((v & 0x7f) | 0x80)); v >>= 7; }
+        s.push_back(static_cast<char>(v));
+    };
+    put_varint(message, (1u << 3) | 0u);
+    put_varint(message, 0u);   // HAVE_SESSION
+
+    push_incoming(msg_type, message);
+}
+
 void Steam_Game_Coordinator::callback_client_welcome()
 {
     if (!gc_initialized)
         return;
+
+    // CS2/CS:GO: announce "GC connected" (HAVE_SESSION) before the welcome so the econ UI unlocks.
+    if (gc_profile == GC_PROFILE_CSGO)
+        send_cs2_connection_status();
 
     uint32 msg_type = EGCBaseClientMsg::k_EMsgGCClientWelcome | protobuf_mask;
     std::string message = build_protomsg_header(msg_type);
