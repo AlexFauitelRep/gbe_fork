@@ -757,12 +757,15 @@ void Steam_Game_Coordinator::callback_client_welcome()
             pv(pd, (3u << 3) | 0u); pv(pd, 1u);             // elevated_state = true (Prime)
             persona->add_object_data(pd);
         }
-        // SO type 43 objects captured from RevEmu (account already patched to the local id).
-        auto t43 = cache.add_objects();
-        t43->set_type_id(43);
-        for (unsigned int k = 0; k < CACHE_TYPE43_COUNT; ++k)
-            t43->add_object_data(std::string(
-                reinterpret_cast<const char *>(CACHE_TYPE43_OBJS) + k * 12, 12));
+        // SO type 43 = CSOEconDefaultEquippedDefinitionInstanceClient (default/stock
+        // item equipped per class+slot).  The RevEmu-captured blob HARD-CODED that
+        // owner's loadout (Tec9 T-slot5, R8 T/CT-slot6, USP-S CT-slot2, M4A4 CT-slot15)
+        // and imposed those weapon POSITIONS on every account regardless of the user's
+        // picks -> the buy-menu variant could never be changed.  All of OUR items are
+        // real inventory items (SO type 1) equipped via equipped_state, so no default-
+        // equipped definitions are needed: we send NONE and let the player's own
+        // equips (type 1 + live 2531 sync) fully own the loadout.
+        // (RevEmu blob kept in gbe_cs2_welcome_extra.h for reference; intentionally unused.)
         std::string cache_bytes;
         cache.SerializeToString(&cache_bytes);
 
