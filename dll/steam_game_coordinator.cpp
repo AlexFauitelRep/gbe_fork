@@ -572,6 +572,33 @@ void Steam_Game_Coordinator::callback_client_welcome()
     protomsg.set_version(gc_profile == GC_PROFILE_CSGO ? static_cast<uint32>(CSGO_SO_CACHE_VERSION) : 0);
 
     protomsg.AppendToString(&message);
+
+    // CS2/CS:GO: RevEmu embeds the econ SO cache *inside* the welcome (field 3,
+    // outofdate_subscribed_caches). The client only marks its econ subsystem "ready"
+    // (and unlocks the Inventory/Loadout tabs) when the welcome itself carries the cache;
+    // a standalone SOCacheSubscribed (24) is not enough. gbe's trimmed CMsgClientWelcome
+    // proto has no caches field, so hand-append field 3 = the serialized CMsgSOCacheSubscribed.
+    if (gc_profile == GC_PROFILE_CSGO) {
+        CSteamID steam_id = settings->get_local_steam_id();
+        load_items_from_file();
+        CMsgSOCacheSubscribed cache;
+        cache.set_owner(steam_id.ConvertToUint64());
+        cache.set_version(CSGO_SO_CACHE_VERSION);
+        auto objects = cache.add_objects();
+        objects->set_type_id(1);
+        for (const Econ_Item &item : items)
+            objects->add_object_data(item_to_gcprotobuf(item, steam_id));
+        std::string cache_bytes;
+        cache.SerializeToString(&cache_bytes);
+        auto put_varint = [](std::string &s, uint64 v) {
+            while (v >= 0x80) { s.push_back(static_cast<char>((v & 0x7f) | 0x80)); v >>= 7; }
+            s.push_back(static_cast<char>(v));
+        };
+        message.push_back(static_cast<char>((3u << 3) | 2u));   // field 3, length-delimited
+        put_varint(message, cache_bytes.size());
+        message += cache_bytes;
+    }
+
     push_incoming(msg_type, message);
 
     // CS2/CS:GO only: also announce the GC as connected (see send_cs2_matchmaking_hello).
