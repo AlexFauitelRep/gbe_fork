@@ -552,7 +552,7 @@ void Steam_Game_Coordinator::handle_cs2_loadout_sync(const void *input, uint32 i
         return result;
     };
 
-    std::map<uint64, std::map<uint16, uint16>> desired; // item_id -> (class -> slot)
+    std::vector<std::tuple<uint16, uint16, uint64>> entries; // (class, slot, item_id)
     while (p < end) {
         uint64 tag = read_varint(p);
         uint32 field = static_cast<uint32>(tag >> 3);
@@ -588,7 +588,7 @@ void Steam_Game_Coordinator::handle_cs2_loadout_sync(const void *input, uint32 i
                 }
             }
             if (item_id)
-                desired[item_id][static_cast<uint16>(cls)] = static_cast<uint16>(slot);
+                entries.emplace_back(static_cast<uint16>(cls), static_cast<uint16>(slot), item_id);
         } else if (wire == 0) {
             read_varint(p);
         } else if (wire == 2) {
@@ -602,23 +602,11 @@ void Steam_Game_Coordinator::handle_cs2_loadout_sync(const void *input, uint32 i
         }
     }
 
-    PRINT_DEBUG("CS2 loadout sync: %zu equipped entries", desired.size());
+    PRINT_DEBUG("CS2 loadout sync: %zu change entries", entries.size());
 
     bool any_changed = false;
-    for (Econ_Item &item : items) {
-        std::map<uint16, uint16> new_state;
-        auto it = desired.find(item.id);
-        if (it != desired.end())
-            new_state = it->second;
-
-        if (item.equip_states == new_state)
-            continue;
-
-        item.equip_states = new_state;
-        any_changed = true;
-
-        // Echo the update so the client shared-object cache stays authoritative
-        // (mirrors handle_adjust_equip_state).
+    // Echo an SO update + persist callback for one changed item (like handle_adjust_equip_state).
+    auto emit = [&](Econ_Item &item) {
         auto inventory_msg = new GameServer_Items_Messages::ItemUpdate();
         inventory_msg->set_id(item.id);
         inventory_msg->set_has_equip_states(true);
@@ -627,18 +615,40 @@ void Steam_Game_Coordinator::handle_cs2_loadout_sync(const void *input, uint32 i
             new_st->set_class_id(class_id);
             new_st->set_slot_id(slot_id);
         }
-
         auto gameserver_items_msg = new GameServer_Items_Messages();
         gameserver_items_msg->set_type(GameServer_Items_Messages::Request_UpdateItem);
         gameserver_items_msg->set_is_gc(true);
         gameserver_items_msg->set_allocated_item_update(inventory_msg);
-
         Common_Message msg{};
         msg.set_allocated_gameserver_items_messages(gameserver_items_msg);
         msg.set_source_id(settings->get_local_steam_id().ConvertToUint64());
         network->sendToAll(&msg, true);
-
         callback_item_updated(settings->get_local_steam_id(), item);
+    };
+
+    // MERGE, not replace: CS2 sends 2531 as the CHANGED slots, not always the full
+    // loadout, so treating it as a full snapshot wiped the knife/gloves/agents that
+    // were not in this particular batch. For each {class,slot,item_id}: equip that
+    // item in the slot and unequip only whatever OTHER item held the SAME (class,slot);
+    // items in unrelated slots are left untouched, so cosmetics survive a weapon-only sync.
+    for (const auto &[cls, slot, iid] : entries) {
+        for (Econ_Item &item : items) {
+            if (item.id == iid) {
+                auto it = item.equip_states.find(cls);
+                if (it == item.equip_states.end() || it->second != slot) {
+                    item.equip_states[cls] = slot;
+                    any_changed = true;
+                    emit(item);
+                }
+            } else {
+                auto it = item.equip_states.find(cls);
+                if (it != item.equip_states.end() && it->second == slot) {
+                    item.equip_states.erase(it);
+                    any_changed = true;
+                    emit(item);
+                }
+            }
+        }
     }
 
     if (any_changed)
