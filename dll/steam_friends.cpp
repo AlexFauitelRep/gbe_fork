@@ -16,6 +16,7 @@
    <http://www.gnu.org/licenses/>.  */
 
 #include "dll/steam_friends.h"
+#include "dll/gbe_avatar_data.h"
 #include "dll/dll.h"
 
 #define SEND_FRIEND_RATE 4.0
@@ -77,26 +78,22 @@ struct Avatar_Numbers Steam_Friends::add_friend_avatars(CSteamID id)
         "account_avatar_default.jpeg",
     };
 
-    if (!settings->disable_account_avatar && (id == settings->get_local_steam_id())) {
-        std::string file_path{};
-        unsigned long long file_size{};
-
-        // try local location first, then try global location
-        for (const auto &settings_path : { Local_Storage::get_game_settings_path(), local_storage->get_global_settings_path() }) {
-            for (const auto &file_name : avatar_icons) {
-                file_path = settings_path + file_name;
-                file_size = file_size_(file_path);
-                if (file_size) break;
+    if (id == settings->get_local_steam_id()) {
+        // Arcade build: the local user's avatar is BAKED INTO the DLL (dll/gbe_avatar_data.h,
+        // 184x184 RGBA, XOR-obfuscated). steam_settings/account_avatar.* and the
+        // enable_account_avatar ini switch are deliberately ignored for the local user so the
+        // avatar cannot be changed from outside. Friends' avatars still follow the normal path.
+        static std::string baked_large{};
+        if (baked_large.empty()) {
+            baked_large.resize(sizeof(GBE_AVATAR_RGBA_ENC));
+            for (size_t i = 0; i < sizeof(GBE_AVATAR_RGBA_ENC); ++i) {
+                baked_large[i] = (char)(GBE_AVATAR_RGBA_ENC[i] ^ GBE_AVATAR_KEY[i % sizeof(GBE_AVATAR_KEY)]);
             }
-            if (file_size) break;
         }
-
-        // no else statement here for default otherwise this breaks default images for friends
-        if (file_size) {
-            small_avatar = Local_Storage::load_image_resized(file_path, "", 32);
-            medium_avatar = Local_Storage::load_image_resized(file_path, "", 64);
-            large_avatar = Local_Storage::load_image_resized(file_path, "", 184);
-        }
+        large_avatar = baked_large;
+        medium_avatar = Local_Storage::load_image_resized("", large_avatar, 64);
+        small_avatar = Local_Storage::load_image_resized("", large_avatar, 32);
+        PRINT_DEBUG("local avatar: baked-in image used (account_avatar.* ignored)");
     } else if (!settings->disable_account_avatar) {
         Friend *f = find_friend(id);
         if (f && (large_avatar.compare(f->avatar()) != 0)) {
