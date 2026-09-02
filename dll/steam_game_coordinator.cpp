@@ -312,12 +312,11 @@ std::string Steam_Game_Coordinator::item_to_gcstruct(const Econ_Item &item, CSte
 std::string Steam_Game_Coordinator::item_to_gcprotobuf(const Econ_Item &item, CSteamID steam_id)
 {
     CSOEconItem proto_item;
-    // CS2 client uses CSOEconItem.id verbatim as the full 64-bit item id and writes
-    // that SAME id into cs2_preferred_items.txt. It must therefore be the composed
-    // (serial<<32)|account form (like csgo_gc), NOT the bare local serial -- otherwise
-    // the client composes a network id for its loadout that never resolves back to the
-    // bare-serial SO-cache item, and the equipped loadout silently reverts to default.
-    proto_item.set_id(item_id_local_to_network(item.id));
+    // NOTE: this build's client expects the BARE local serial as CSOEconItem.id and
+    // composes the network id itself; sending the pre-composed (serial<<32)|account
+    // here made the client fail to resolve any item (all skins vanished). Keep the
+    // bare serial.
+    proto_item.set_id(item.id);
     proto_item.set_account_id(steam_id.GetAccountID());
     proto_item.set_inventory(item.inv_pos);
     proto_item.set_def_index(item.def);
@@ -1544,18 +1543,6 @@ EGCResults Steam_Game_Coordinator::SendMessage_( uint32 unMsgType, const void *p
             PRINT_DEBUG("CS2 loadout sync (2531) -> persist equip_states");
             handle_cs2_loadout_sync(pubData, cubData);
             break;
-        case 4006u | protobuf_mask:  // k_EMsgGCClientHello
-        case 4006u:
-            // Deliver the ClientWelcome + SO cache SYNCHRONOUSLY in response to the
-            // client's hello (like csgo_gc's OnClientHello / a real GC), so the SO
-            // cache with equipped_state is in the queue the moment the client polls
-            // it -- the menu loadout screen reads the cache instead of falling back
-            // to defaults. gbe's proactive gc_init welcome fires before the client
-            // even says hello, which the client ignores.
-            PRINT_DEBUG("CS2 GC ClientHello (4006) -> (re)send ClientWelcome + hello");
-            callback_client_welcome();
-            send_cs2_matchmaking_hello();
-            break;
         default: {
             // Capture unhandled client->GC messages (e.g. CS2 loadout/equip flow) so we can
             // reverse-engineer them. Dump a hex preview of the payload into the debug log.
@@ -1580,6 +1567,10 @@ bool Steam_Game_Coordinator::IsMessageAvailable( uint32 *pcubMsgSize )
 {
     PRINT_DEBUG_ENTRY();
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
+
+    // client.dll polls the GC on the game MAIN thread -> the one safe place to inject
+    // the menu loadout into client.dll (never from gbe's background callback thread).
+    cs2_menu_inject_tick();
 
     if (!gc_initialized || incoming_messages.empty()) {
         *pcubMsgSize = 0;
@@ -1941,6 +1932,124 @@ void Steam_Game_Coordinator::network_callback(Common_Message *msg)
             }
         }
     }
+}
+
+#ifdef __WINDOWS__
+// ---- CS2 offline main-menu loadout injection --------------------------------
+// The offline client does NOT populate the Снаряжение / loadout view from the
+// SO-cache equip_states alone (confirmed: GC re-subscribe never fills the offline
+// menu). The only mechanism that works is an active EquipItemInLoadout() call into
+// client.dll — exactly what the old RevEmu proxy did. gbe (steamclient64.dll) is
+// always in-process (unlike the CSS plugin, which only lives during a match), so it
+// drives the menu here, on the game main thread (from IsMessageAvailable, which
+// client.dll polls on the main thread — never from gbe's background callback thread).
+//
+// Primitives reversed on the deployed client.dll (imagebase 0x180000000):
+//   inv-mgr getter         RVA 0x7FC610  (lea rax,[mgr]; ret) -> mgr @RVA 0x2333570
+//   CCSInventoryManager    vtable RVA 0x1AAC0E8
+//   EquipItemInLoadout     vt[69] RVA 0x7FD690  char(this,int team,int slot,u64 id)
+//   CCSPlayerInventory     vtable RVA 0x1AAC020
+//   GetItemInLoadout       vt[8]  RVA 0x7FF460  (cross-check only)
+//   fire inventory_updated RVA 0x10DE330 (prologue 48 83 EC 28 48 8B 0D)
+//   local inventory ptr    mgr + 0x3F540
+// Every raw access runs under SEH: a wrong offset or a not-yet-constructed object
+// yields a no-op + retry, never a crash. The item id passed is exactly the value
+// gbe sent as CSOEconItem.id (items[].id), so it always matches the client econ cache.
+namespace {
+    constexpr uintptr_t CS2_RVA_INVMGR_OBJECT = 0x2333570;
+    constexpr uintptr_t CS2_RVA_INVMGR_VTABLE = 0x1AAC0E8;
+    constexpr int       CS2_VTI_EQUIP         = 69;
+    constexpr uintptr_t CS2_RVA_EQUIP         = 0x7FD690;
+    constexpr uintptr_t CS2_RVA_PINV_VTABLE   = 0x1AAC020;
+    constexpr int       CS2_VTI_GET_ITEM      = 8;
+    constexpr uintptr_t CS2_RVA_GET_ITEM      = 0x7FF460;
+    constexpr uintptr_t CS2_RVA_FIRE_INVUPD   = 0x10DE330;
+    constexpr uintptr_t CS2_OFF_MGR_LOCAL_INV = 0x3F540;
+
+    struct CS2InjSlot { int team; int slot; uint64 id; };
+    typedef char (__fastcall *CS2EquipFn)(void *thisptr, int team, int slot, uint64 item_id);
+    typedef void (__fastcall *CS2FireFn)(void);
+
+    // POD-only, SEH-guarded. Returns applied count (>=0) on success; -1 if the client
+    // inventory manager / local inventory is not constructed yet (retry); -2 if a raw
+    // access faulted (retry). No C++ objects here so __try/__except is legal.
+    static int cs2_inject_raw(uintptr_t base, const CS2InjSlot *slots, int n)
+    {
+        __try {
+            void *mgr = reinterpret_cast<void*>(base + CS2_RVA_INVMGR_OBJECT);
+            if (*reinterpret_cast<uintptr_t*>(mgr) != base + CS2_RVA_INVMGR_VTABLE)
+                return -1;                                    // mgr not constructed
+            uintptr_t *vt = *reinterpret_cast<uintptr_t**>(mgr);
+            uintptr_t equip = vt[CS2_VTI_EQUIP];
+            if (equip != base + CS2_RVA_EQUIP) return -1;     // vtable layout mismatch
+            // [mgr + 0x3F540] is the local player-inventory pointer that
+            // EquipItemInLoadout itself dereferences (verified: both EquipItemInLoadout
+            // @0x7FD73C and GetServerLoadoutInSlot @0x8C4B58 load `[this + 0x3F540]`).
+            // Non-null == inventory constructed. We do NOT hard-check its vtable against
+            // CCSPlayerInventory (0x1AAC020 / GetItemInLoadout 0x7FF460) because the
+            // offline object may be a subclass; the manager + equip vtables are already
+            // verified, and the whole body runs under SEH, so calling Equip is safe.
+            uintptr_t localInv = *reinterpret_cast<uintptr_t*>(
+                reinterpret_cast<uint8_t*>(mgr) + CS2_OFF_MGR_LOCAL_INV);
+            if (!localInv) return -1;                         // inventory not ready yet
+
+            CS2EquipFn Equip = reinterpret_cast<CS2EquipFn>(equip);
+            int applied = 0;
+            for (int i = 0; i < n; ++i) {
+                Equip(mgr, slots[i].team, slots[i].slot, slots[i].id);
+                ++applied;
+            }
+            if (applied > 0) {
+                const uint8_t *fp = reinterpret_cast<const uint8_t*>(base + CS2_RVA_FIRE_INVUPD);
+                static const uint8_t kFirePro[7] = {0x48,0x83,0xEC,0x28,0x48,0x8B,0x0D};
+                bool ok = true;
+                for (int i = 0; i < 7; ++i) if (fp[i] != kFirePro[i]) { ok = false; break; }
+                if (ok) reinterpret_cast<CS2FireFn>(base + CS2_RVA_FIRE_INVUPD)();
+            }
+            return applied;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            return -2;
+        }
+    }
+}
+#endif // __WINDOWS__
+
+void Steam_Game_Coordinator::cs2_menu_inject_tick()
+{
+#ifdef __WINDOWS__
+    if (cs2_menu_inject_done) return;
+    if (gc_profile != GC_PROFILE_CSGO || !gc_initialized) return;
+    if (items.empty()) return;
+
+    auto now = std::chrono::high_resolution_clock::now();
+    if (cs2_menu_inject_arm_time.time_since_epoch().count() == 0)
+        cs2_menu_inject_arm_time = now;                        // arm on first eligible tick
+    if (!check_timedout(cs2_menu_inject_arm_time, 3.0)) return; // let the client ingest the SO cache
+    if (!check_timedout(cs2_menu_inject_last, 1.0)) return;     // apply at most once per second
+    cs2_menu_inject_last = now;
+
+    HMODULE client = GetModuleHandleW(L"client.dll");
+    if (!client) return;
+    uintptr_t base = reinterpret_cast<uintptr_t>(client);
+
+    std::vector<CS2InjSlot> slots;
+    slots.reserve(64);
+    for (const auto &it : items)
+        for (const auto &es : it.equip_states)
+            slots.push_back(CS2InjSlot{ static_cast<int>(es.first), static_cast<int>(es.second), it.id });
+    if (slots.empty()) { cs2_menu_inject_done = true; return; }
+
+    int r = cs2_inject_raw(base, slots.data(), static_cast<int>(slots.size()));
+    if (r >= 0) {
+        // Re-apply once per second across a 3s..12s window (EquipItemInLoadout is
+        // idempotent) so the loadout still lands even if the client had not finished
+        // ingesting the SO cache on the first successful pass; latch after the window.
+        PRINT_DEBUG("cs2_menu_inject: applied %d equipped loadout slots", r);
+        if (check_timedout(cs2_menu_inject_arm_time, 12.0))
+            cs2_menu_inject_done = true;
+    }
+#endif
 }
 
 void Steam_Game_Coordinator::RunCallbacks()

@@ -72,6 +72,14 @@ public ISteamGameCoordinator
     std::vector<Econ_Item> items;
     bool items_loaded{};
 
+    // CS2 offline: one-shot injection of the saved equipped loadout into client.dll
+    // so the main-menu Снаряжение screen shows the persisted skins (the offline SO
+    // cache alone does not populate that view — an EquipItemInLoadout call is required,
+    // exactly as the old RevEmu proxy did). Windows-only, heavily guarded.
+    bool cs2_menu_inject_done{};
+    std::chrono::high_resolution_clock::time_point cs2_menu_inject_arm_time{};
+    std::chrono::high_resolution_clock::time_point cs2_menu_inject_last{};
+
     struct RequestInventory
     {
         std::chrono::high_resolution_clock::time_point created{};
@@ -112,6 +120,7 @@ public ISteamGameCoordinator
     void handle_set_item_style(const void *input, uint32 input_size);
     void handle_adjust_equip_state(const void *input, uint32 input_size);
     void handle_cs2_loadout_sync(const void *input, uint32 input_size);
+    void cs2_menu_inject_tick();
     void handle_set_multiple_item_pos(const void *input, uint32 input_size);
 
     void callback_client_welcome();
