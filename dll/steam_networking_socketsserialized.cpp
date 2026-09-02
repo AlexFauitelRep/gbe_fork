@@ -17,6 +17,7 @@
 
 #include "dll/steam_networking_socketsserialized.h"
 #include "dll/gbe_sdr_cert_data.h"
+#include "dll/local_storage.h"
 
 
 void Steam_Networking_Sockets_Serialized::steam_callback(void *object, Common_Message *msg)
@@ -77,17 +78,36 @@ SteamAPICall_t Steam_Networking_Sockets_Serialized::GetCertAsync()
     // invalid cert" and gates the inventory/econ UI behind "Steam connection error".
     struct SteamNetworkingSocketsCert_t data = {};
     data.m_eResult = k_EResultOK;
+    data.m_caKeyID = GBE_SDR_CA_KEY_ID;   // single CA for the whole cert pool
 
-    data.m_cbCert = GBE_SDR_CERT_LEN;
-    memcpy(data.m_certOrMsg, GBE_SDR_CERT, GBE_SDR_CERT_LEN);
+    // Per-machine SDR cert (Route 2): prefer cert/sig/privkey from
+    // <game>\steam_settings\sdr_cert\ so each machine presents a certificate whose
+    // identity == its OWN SteamID. Required for LAN: if two machines share the same
+    // cert identity, the client's GameNetworkingSockets treats the remote peer as
+    // "self" and the connect stalls in "finding route" until timeout. Falls back to
+    // the baked (76561199172302864) cert when the folder/files are absent or malformed
+    // (dev / single-PC use). The CA key id is always the baked one (one CA per pool).
+    {
+        const std::string dir = Local_Storage::get_game_settings_path() + "sdr_cert" + PATH_SEPARATOR;
+        char certBuf[sizeof(data.m_certOrMsg)];
+        char sigBuf[sizeof(data.m_signature)];
+        char privBuf[sizeof(data.m_privKey)];
+        int nCert = Local_Storage::get_file_data(dir + "cert.bin",    certBuf, (unsigned int)sizeof(certBuf));
+        int nSig  = Local_Storage::get_file_data(dir + "sig.bin",     sigBuf,  (unsigned int)sizeof(sigBuf));
+        int nPriv = Local_Storage::get_file_data(dir + "id_priv.bin", privBuf, (unsigned int)sizeof(privBuf));
 
-    data.m_caKeyID = GBE_SDR_CA_KEY_ID;
-
-    data.m_cbSignature = GBE_SDR_SIG_LEN;
-    memcpy(data.m_signature, GBE_SDR_SIG, GBE_SDR_SIG_LEN);
-
-    data.m_cbPrivKey = sizeof(GBE_SDR_ID_PRIV);
-    memcpy(data.m_privKey, GBE_SDR_ID_PRIV, sizeof(GBE_SDR_ID_PRIV));
+        if (nCert > 0 && nCert <= (int)sizeof(data.m_certOrMsg) && nSig == 64 && nPriv == 64) {
+            data.m_cbCert      = (uint32)nCert;  memcpy(data.m_certOrMsg, certBuf, (size_t)nCert);
+            data.m_cbSignature = (uint32)nSig;   memcpy(data.m_signature, sigBuf,  (size_t)nSig);
+            data.m_cbPrivKey   = (uint32)nPriv;  memcpy(data.m_privKey,   privBuf, (size_t)nPriv);
+            PRINT_DEBUG("GetCertAsync: per-machine SDR cert loaded from steam_settings/sdr_cert (cert=%d)", nCert);
+        } else {
+            data.m_cbCert      = GBE_SDR_CERT_LEN;           memcpy(data.m_certOrMsg, GBE_SDR_CERT, GBE_SDR_CERT_LEN);
+            data.m_cbSignature = GBE_SDR_SIG_LEN;            memcpy(data.m_signature, GBE_SDR_SIG, GBE_SDR_SIG_LEN);
+            data.m_cbPrivKey   = sizeof(GBE_SDR_ID_PRIV);    memcpy(data.m_privKey,   GBE_SDR_ID_PRIV, sizeof(GBE_SDR_ID_PRIV));
+            PRINT_DEBUG("GetCertAsync: baked static SDR cert (76561199172302864 fallback)");
+        }
+    }
 
     auto ret = callback_results->addCallResult(data.k_iCallback, &data, sizeof(data));
     callbacks->addCBResult(data.k_iCallback, &data, sizeof(data));
