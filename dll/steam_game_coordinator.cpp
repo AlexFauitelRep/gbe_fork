@@ -662,8 +662,21 @@ void Steam_Game_Coordinator::handle_cs2_loadout_sync(const void *input, uint32 i
         }
     }
 
-    if (any_changed)
+    if (any_changed) {
         save_items_to_file();
+#ifdef __WINDOWS__
+        // Re-arm the main-menu injection (cs2_menu_inject_tick): the client keeps the new
+        // item in its loadout (later 2531 snapshots carry it) but the Снаряжение view and
+        // the character preview only refresh for tradable agents (prefab
+        // customplayertradable, legacy_character 0) after an active EquipItemInLoadout()
+        // + inventory_updated, exactly like at startup. Re-applying the persisted
+        // equip_states for ~5s makes the menu reflect the choice immediately. Converges:
+        // the client's echo snapshot equals ours -> any_changed stays false -> no re-arm.
+        cs2_menu_inject_done = false;
+        cs2_menu_inject_first_ok = {};
+        PRINT_DEBUG("CS2 loadout sync: menu injection re-armed");
+#endif
+    }
 }
 
 void Steam_Game_Coordinator::handle_set_multiple_item_pos(const void *input, uint32 input_size)
