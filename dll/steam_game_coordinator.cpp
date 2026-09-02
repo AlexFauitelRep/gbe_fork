@@ -571,6 +571,7 @@ void Steam_Game_Coordinator::handle_cs2_loadout_sync(const void *input, uint32 i
 
             uint32 cls = 0, slot = 0;
             uint64 item_id = 0;
+            std::string raw_fields;   // debug: every field of this entry (finds how STOCK variants are encoded)
             const char *q = sub;
             while (q < sub_end) {
                 uint64 t2 = read_varint(q);
@@ -581,6 +582,7 @@ void Steam_Game_Coordinator::handle_cs2_loadout_sync(const void *input, uint32 i
                     if (f2 == 1) cls = static_cast<uint32>(v);
                     else if (f2 == 2) slot = static_cast<uint32>(v);
                     else if (f2 == 3) item_id = v;
+                    raw_fields += " f" + std::to_string(f2) + "=" + std::to_string(v);
                 } else if (w2 == 2) {
                     uint64 l = read_varint(q); q += l;
                 } else if (w2 == 5) {
@@ -591,6 +593,7 @@ void Steam_Game_Coordinator::handle_cs2_loadout_sync(const void *input, uint32 i
                     break;
                 }
             }
+            PRINT_DEBUG("  2531 raw entry: class=%u slot=%u item_id=%llu fields:%s", cls, slot, item_id, raw_fields.c_str());
             if (item_id)
                 entries.emplace_back(static_cast<uint16>(cls), static_cast<uint16>(slot), item_id);
         } else if (wire == 0) {
