@@ -16,6 +16,7 @@
    <http://www.gnu.org/licenses/>.  */
 
 #include "dll/steam_game_coordinator.h"
+#include <set>
 #include "dll/gbe_cs2_hello_template.h"
 #include "dll/gbe_cs2_store_template.h"
 #include "dll/gbe_cs2_welcome_extra.h"
@@ -665,6 +666,43 @@ void Steam_Game_Coordinator::handle_cs2_loadout_sync(const void *input, uint32 i
         }
     }
 
+    // FULL-SNAPSHOT semantics (verified 2026-09-03 with a raw dump): CS2 sends its complete
+    // equipped loadout -- every class, every equipped item, fields class/slot/item_id only.
+    // A slot switched to a STOCK weapon simply disappears from the snapshot (no item_id=0
+    // entry, no other GC message), so an item still equipped in a (class, slot) the snapshot
+    // no longer names must be unequipped -- otherwise the old skin variant (e.g. M4A1-S)
+    // stays equipped here, the server keeps giving it and the next start re-injects it into
+    // the menu ("cannot switch back to the plain M4A4"). Guarded against partial / early
+    // syncs: applied only when the snapshot is plausibly complete (both classes, >= 8 rows).
+    {
+        bool has_t = false, has_ct = false;
+        for (const auto &[cls, slot, iid] : entries) {
+            if (cls == 2) has_t = true;
+            else if (cls == 3) has_ct = true;
+        }
+        if (entries.size() >= 8 && has_t && has_ct) {
+            std::set<std::pair<uint32, uint32>> named;
+            for (const auto &[cls, slot, iid] : entries)
+                named.emplace(static_cast<uint32>(cls), static_cast<uint32>(slot));
+            for (Econ_Item &item : items) {
+                bool changed = false;
+                for (auto it = item.equip_states.begin(); it != item.equip_states.end();) {
+                    uint32 c = static_cast<uint32>(it->first), sl = static_cast<uint32>(it->second);
+                    if ((c == 2 || c == 3) && !named.count({c, sl})) {
+                        PRINT_DEBUG("  2531 (class=%u slot=%u) absent from snapshot -> unequip item %llu (stock pick)", c, sl, item.id);
+                        it = item.equip_states.erase(it);
+                        changed = true;
+                        any_changed = true;
+                    } else {
+                        ++it;
+                    }
+                }
+                if (changed)
+                    emit(item);
+            }
+        }
+    }
+
     if (any_changed) {
         save_items_to_file();
 #ifdef __WINDOWS__
@@ -811,6 +849,34 @@ void Steam_Game_Coordinator::callback_client_welcome()
         // equipped definitions are needed: we send NONE and let the player's own
         // equips (type 1 + live 2531 sync) fully own the loadout.
         // (RevEmu blob kept in gbe_cs2_welcome_extra.h for reference; intentionally unused.)
+        // SO type 43 (CSOEconDefaultEquippedDefinitionInstanceClient) for the player's STOCK
+        // picks in shared slots (M4A4/M4A1-S, USP-S/P2000, Deagle/R8, ...). The client never
+        // tells the GC which stock def it chose; the RevEmuLoadoutBridge plugin reads the
+        // client's live loadout in-process and mirrors stock buyable slots into
+        // <save>/730/default_equipped.json as [{"class":3,"slot":15,"def":16},...]. Handing
+        // them back here makes the choice survive a restart (else it reverts to the game
+        // default). Encoding verified against the RevEmu capture: 1=account 2=def 3=class 4=slot.
+        {
+            nlohmann::json defs;
+            if (local_storage->load_json_file("", "default_equipped.json", defs) && defs.is_array()) {
+                uint32 acct = settings->get_local_steam_id().GetAccountID();
+                int n = 0;
+                for (const auto &e : defs) {
+                    if (!e.is_object() || !e.contains("class") || !e.contains("slot") || !e.contains("def"))
+                        continue;
+                    auto obj = cache.add_objects();
+                    obj->set_type_id(43);
+                    std::string d;
+                    pv(d, (1u << 3) | 0u); pv(d, acct);
+                    pv(d, (2u << 3) | 0u); pv(d, e["def"].get<uint32>());
+                    pv(d, (3u << 3) | 0u); pv(d, e["class"].get<uint32>());
+                    pv(d, (4u << 3) | 0u); pv(d, e["slot"].get<uint32>());
+                    obj->add_object_data(d);
+                    ++n;
+                }
+                PRINT_DEBUG("CS2 welcome: %d default-equipped (type 43) objects from default_equipped.json", n);
+            }
+        }
         std::string cache_bytes;
         cache.SerializeToString(&cache_bytes);
 
