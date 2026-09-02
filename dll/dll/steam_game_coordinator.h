@@ -77,8 +77,9 @@ public ISteamGameCoordinator
     // cache alone does not populate that view — an EquipItemInLoadout call is required,
     // exactly as the old RevEmu proxy did). Windows-only, heavily guarded.
     bool cs2_menu_inject_done{};
-    std::chrono::high_resolution_clock::time_point cs2_menu_inject_arm_time{};
     std::chrono::high_resolution_clock::time_point cs2_menu_inject_last{};
+    std::chrono::high_resolution_clock::time_point cs2_menu_inject_first_ok{};
+    unsigned long cs2_main_thread_id{};
 
     struct RequestInventory
     {

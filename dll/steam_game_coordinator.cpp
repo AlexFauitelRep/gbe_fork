@@ -729,6 +729,14 @@ void Steam_Game_Coordinator::callback_client_welcome()
     if (!gc_initialized)
         return;
 
+#ifdef __WINDOWS__
+    // A (re)subscribe rebuilds the client's local inventory and clears its loadout view,
+    // so re-arm the menu injection to re-apply the saved loadout (e.g. after returning to
+    // the main menu from a match). Harmless if nothing changed (idempotent equips).
+    cs2_menu_inject_done = false;
+    cs2_menu_inject_first_ok = {};
+#endif
+
     uint32 msg_type = EGCBaseClientMsg::k_EMsgGCClientWelcome | protobuf_mask;
 
     if (gc_profile == GC_PROFILE_CSGO) {
@@ -1568,8 +1576,9 @@ bool Steam_Game_Coordinator::IsMessageAvailable( uint32 *pcubMsgSize )
     PRINT_DEBUG_ENTRY();
     std::lock_guard<std::recursive_mutex> lock(global_mutex);
 
-    // client.dll polls the GC on the game MAIN thread -> the one safe place to inject
-    // the menu loadout into client.dll (never from gbe's background callback thread).
+    // client.dll polls the GC on the game MAIN thread: record it so the injection (also
+    // driven from RunCallbacks for low latency) only ever touches client.dll on this thread.
+    if (cs2_main_thread_id == 0) cs2_main_thread_id = GetCurrentThreadId();
     cs2_menu_inject_tick();
 
     if (!gc_initialized || incoming_messages.empty()) {
@@ -2019,14 +2028,18 @@ void Steam_Game_Coordinator::cs2_menu_inject_tick()
 {
 #ifdef __WINDOWS__
     if (cs2_menu_inject_done) return;
+    // Main-thread only. This is also called from RunCallbacks (every frame -> fires as
+    // soon as the client inventory is ready, instead of waiting for the sparse GC poll),
+    // but RunCallbacks can run on gbe's background thread; client.dll must be touched
+    // only from the game main thread that IsMessageAvailable established.
+    if (cs2_main_thread_id == 0 || GetCurrentThreadId() != cs2_main_thread_id) return;
+    std::lock_guard<std::recursive_mutex> lock(global_mutex);   // recursive: nested under IsMessageAvailable is fine
+    if (cs2_menu_inject_done) return;
     if (gc_profile != GC_PROFILE_CSGO || !gc_initialized) return;
     if (items.empty()) return;
 
     auto now = std::chrono::high_resolution_clock::now();
-    if (cs2_menu_inject_arm_time.time_since_epoch().count() == 0)
-        cs2_menu_inject_arm_time = now;                        // arm on first eligible tick
-    if (!check_timedout(cs2_menu_inject_arm_time, 3.0)) return; // let the client ingest the SO cache
-    if (!check_timedout(cs2_menu_inject_last, 1.0)) return;     // apply at most once per second
+    if (!check_timedout(cs2_menu_inject_last, 0.25)) return;    // throttle ~4x/sec
     cs2_menu_inject_last = now;
 
     HMODULE client = GetModuleHandleW(L"client.dll");
@@ -2042,11 +2055,13 @@ void Steam_Game_Coordinator::cs2_menu_inject_tick()
 
     int r = cs2_inject_raw(base, slots.data(), static_cast<int>(slots.size()));
     if (r >= 0) {
-        // Re-apply once per second across a 3s..12s window (EquipItemInLoadout is
-        // idempotent) so the loadout still lands even if the client had not finished
-        // ingesting the SO cache on the first successful pass; latch after the window.
+        // The guards only pass once the client's local inventory is constructed, so the
+        // first success is the earliest safe moment. Keep re-applying (idempotent) for a
+        // few seconds to catch cache items that stream in slightly later, then latch.
+        if (cs2_menu_inject_first_ok.time_since_epoch().count() == 0)
+            cs2_menu_inject_first_ok = now;
         PRINT_DEBUG("cs2_menu_inject: applied %d equipped loadout slots", r);
-        if (check_timedout(cs2_menu_inject_arm_time, 12.0))
+        if (check_timedout(cs2_menu_inject_first_ok, 5.0))
             cs2_menu_inject_done = true;
     }
 #endif
@@ -2054,6 +2069,12 @@ void Steam_Game_Coordinator::cs2_menu_inject_tick()
 
 void Steam_Game_Coordinator::RunCallbacks()
 {
+    // Fire the menu injection every frame (main thread) so it lands the instant the
+    // client inventory is ready, instead of waiting for the sparse GC IsMessageAvailable
+    // poll (~10s gaps). The tick is main-thread-guarded, so this is a no-op on gbe's
+    // background callback thread.
+    cs2_menu_inject_tick();
+
     if (delay_init && welcome_received && check_timedout(welcome_time, 0.2)) {
         delay_init = false;
     }
