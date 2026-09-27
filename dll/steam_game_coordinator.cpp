@@ -2035,27 +2035,32 @@ void Steam_Game_Coordinator::network_callback(Common_Message *msg)
 // drives the menu here, on the game main thread (from IsMessageAvailable, which
 // client.dll polls on the main thread — never from gbe's background callback thread).
 //
-// Primitives reversed on the deployed client.dll (imagebase 0x180000000):
-//   inv-mgr getter         RVA 0x7FC610  (lea rax,[mgr]; ret) -> mgr @RVA 0x2333570
-//   CCSInventoryManager    vtable RVA 0x1AAC0E8
-//   EquipItemInLoadout     vt[69] RVA 0x7FD690  char(this,int team,int slot,u64 id)
-//   CCSPlayerInventory     vtable RVA 0x1AAC020
-//   GetItemInLoadout       vt[8]  RVA 0x7FF460  (cross-check only)
-//   fire inventory_updated RVA 0x10DE330 (prologue 48 83 EC 28 48 8B 0D)
-//   local inventory ptr    mgr + 0x3F540
+// Primitives reversed on the deployed client.dll (imagebase 0x180000000).
+// RETARGETED to CS2 build 2000917 (1.41.8.4) 2026-09-27; 2000885 values in ( ).
+// Ported via analysis/port-2000917 (offsets-2000917.json) + petool disasm; every
+// value re-verified against D:\1.41.8.4\...\client.dll (VTI 69/8 confirmed, fire
+// prologue confirmed, singleton from InvMgrGetter caller).
+//   inv-mgr getter         RVA 0x839CC0 (0x7FC610) (lea rax,[mgr]; ret) -> mgr @RVA 0x24D14A0 (0x2333570)
+//   CCSInventoryManager    vtable RVA 0x1C02160 (0x1AAC0E8)
+//   EquipItemInLoadout     vt[69] RVA 0x83AD40 (0x7FD690)  char(this,int team,int slot,u64 id)
+//   CCSPlayerInventory     vtable RVA 0x1C02098 (0x1AAC020)
+//   GetItemInLoadout       vt[8]  RVA 0x83CB10 (0x7FF460)  (cross-check only)
+//   fire inventory_updated RVA 0x1172760 (0x10DE330) (prologue 48 83 EC 28 48 8B 0D; lea rdx,[str "inventory_updated"])
+//   local inventory ptr    mgr + 0x52900 (0x3F540)
 // Every raw access runs under SEH: a wrong offset or a not-yet-constructed object
 // yields a no-op + retry, never a crash. The item id passed is exactly the value
 // gbe sent as CSOEconItem.id (items[].id), so it always matches the client econ cache.
 namespace {
-    constexpr uintptr_t CS2_RVA_INVMGR_OBJECT = 0x2333570;
-    constexpr uintptr_t CS2_RVA_INVMGR_VTABLE = 0x1AAC0E8;
-    constexpr int       CS2_VTI_EQUIP         = 69;
-    constexpr uintptr_t CS2_RVA_EQUIP         = 0x7FD690;
-    constexpr uintptr_t CS2_RVA_PINV_VTABLE   = 0x1AAC020;
-    constexpr int       CS2_VTI_GET_ITEM      = 8;
-    constexpr uintptr_t CS2_RVA_GET_ITEM      = 0x7FF460;
-    constexpr uintptr_t CS2_RVA_FIRE_INVUPD   = 0x10DE330;
-    constexpr uintptr_t CS2_OFF_MGR_LOCAL_INV = 0x3F540;
+    // CS2 build 2000917 (1.41.8.4). 2000885 values kept in trailing comments.
+    constexpr uintptr_t CS2_RVA_INVMGR_OBJECT = 0x24D14A0;  // 0x2333570
+    constexpr uintptr_t CS2_RVA_INVMGR_VTABLE = 0x1C02160;  // 0x1AAC0E8
+    constexpr int       CS2_VTI_EQUIP         = 69;         // unchanged (verified)
+    constexpr uintptr_t CS2_RVA_EQUIP         = 0x83AD40;   // 0x7FD690
+    constexpr uintptr_t CS2_RVA_PINV_VTABLE   = 0x1C02098;  // 0x1AAC020
+    constexpr int       CS2_VTI_GET_ITEM      = 8;          // unchanged (verified)
+    constexpr uintptr_t CS2_RVA_GET_ITEM      = 0x83CB10;   // 0x7FF460
+    constexpr uintptr_t CS2_RVA_FIRE_INVUPD   = 0x1172760;  // 0x10DE330
+    constexpr uintptr_t CS2_OFF_MGR_LOCAL_INV = 0x52900;    // 0x3F540
 
     struct CS2InjSlot { int team; int slot; uint64 id; };
     typedef char (__fastcall *CS2EquipFn)(void *thisptr, int team, int slot, uint64 item_id);
